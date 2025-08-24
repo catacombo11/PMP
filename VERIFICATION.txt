@@ -1,0 +1,336 @@
+/**************************************
+ VERIFICATION DETECTOR (ultra-fast, namespaced)
+ Column J: YES / OPTIONAL / NO
+ Pipeline per batch (in parallel):
+   1) /about  (strong YES/NO/OPT from sidebar/submit text)
+   2) /about/rules   (only for unresolved)
+   3) /about/sticky?num=1,2  (only for unresolved)
+   4) /wiki/verification (only for unresolved, capped)
+ Bulk fetchAll + bulk write ⇒ big speedup.
+ **************************************/
+
+/******** CONFIG (namespaced) ********/
+const V_CLIENT_ID     = 'EqV_ifon5S_P2cs6mN7-Kw';
+const V_CLIENT_SECRET = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';
+const V_UA            = 'gsheets-reddit-verif';
+const V_START_ROW     = 2;
+
+// Batch controls
+const V_GROUP_SIZE    = 70;             // subs handled in parallel per run
+const V_MAX_EXEC_MS   = 5*60*1000-15000;// stop early to avoid TLE
+const V_SLEEP_MS      = 120;            // tiny cushion between stages
+
+// Data sources toggles
+const V_USE_RULES     = true;
+const V_USE_STICKIES  = true;
+const V_USE_WIKI      = true;           // only for unresolved after all
+
+// Sheet columns (A=1)
+const V_COL = { SUB:1, VERIF:10 };
+
+// Manual lock prefix (if you want to freeze a cell)
+const V_LOCK_PREFIX = 'LOCK:';
+
+/******** MENU (call V_addMenu in your global onOpen if needed) ********/
+function V_addMenu(){
+  SpreadsheetApp.getUi().createMenu('Verification Tools')
+    .addItem('Start (ALL rows)','V_startAll')
+    .addItem('Start (BLANKS only)','V_startBlanks')
+    .addItem('Status','V_status')
+    .addItem('Stop','V_stop')
+    .addItem('Reset progress','V_reset')
+    .addToUi();
+}
+
+/******** PUBLIC ACTIONS ********/
+function V_startAll(){ V_boot_('all'); }
+function V_startBlanks(){ V_boot_('blanks'); }
+function V_status(){
+  const p=PropertiesService.getDocumentProperties();
+  V_toast_(`Verification ${+(p.getProperty('v_idx')||0)}/${+(p.getProperty('v_total')||0)}`,5);
+}
+function V_stop(){ PropertiesService.getDocumentProperties().setProperty('V_HALT','1'); V_delTrig_(); V_toast_('Verification: stop requested',3); }
+function V_reset(){
+  const p=PropertiesService.getDocumentProperties();
+  ['v_rows','v_idx','v_total','v_mode','V_HALT'].forEach(k=>p.deleteProperty(k));
+  V_toast_('Verification: state reset',3);
+}
+function V_boot_(mode){
+  const p=PropertiesService.getDocumentProperties();
+  ['v_rows','v_idx','v_total','v_mode','V_HALT'].forEach(k=>p.deleteProperty(k));
+  p.setProperty('v_mode',mode);
+  V_ensureTrig_();
+  V_runBatch_();
+}
+
+/******** CORE BATCH (parallel, staged) ********/
+function V_runBatch_(){
+  const lock=LockService.getDocumentLock();
+  if(!lock.tryLock(0)) return;
+  try{
+    const sh=SpreadsheetApp.getActiveSheet();
+    const last=sh.getLastRow();
+    if(last<V_START_ROW) return;
+
+    const p=PropertiesService.getDocumentProperties();
+    if(p.getProperty('V_HALT')==='1'){ V_delTrig_(); return; }
+
+    if(!p.getProperty('v_rows')){
+      const mode=p.getProperty('v_mode')||'blanks';
+      const rows=V_buildRows_(sh,last,mode);
+      p.setProperty('v_rows',JSON.stringify(rows));
+      p.setProperty('v_idx','0');
+      p.setProperty('v_total',String(rows.length));
+      if(!rows.length){ V_toast_(`Verification: nothing to process (${mode})`,3); V_delTrig_(); return; }
+    }
+
+    const start=Date.now(), deadline=start+V_MAX_EXEC_MS;
+    const rows=JSON.parse(p.getProperty('v_rows')||'[]');
+    let idx=+(p.getProperty('v_idx')||0);
+
+    while(idx<rows.length){
+      if(Date.now()>deadline){ p.setProperty('v_idx',String(idx)); V_toast_(`Yield at ${idx}/${rows.length}`,3); return; }
+
+      const chunkRows = rows.slice(idx, Math.min(rows.length, idx+V_GROUP_SIZE));
+      const subs = sh.getRange(chunkRows[0], V_COL.SUB, chunkRows.length, 1).getValues().map(r=>String(r[0]||'').replace(/^r\//,'').trim());
+
+      // pipeline state
+      const results = new Array(chunkRows.length).fill(null); // {label,reason}
+      const unresolvedIdx = [];
+
+      // Stage 1: /about for all
+      const aboutUrls = subs.map(s=>`https://oauth.reddit.com/r/${encodeURIComponent(s)}/about`);
+      const aboutJson = V_fetchAll_(aboutUrls);
+      for(let i=0;i<subs.length;i++){
+        const txt = V_textFromAbout_(aboutJson[i]);
+        const r = V_classifyText_(txt);
+        if(r && r.strength>=2) results[i]={label:r.label, reason:`about: ${r.reason}`};
+        else unresolvedIdx.push(i);
+      }
+      Utilities.sleep(V_SLEEP_MS);
+
+      // Stage 2: /about/rules for unresolved
+      if(V_USE_RULES && unresolvedIdx.length){
+        const rulesUrls = unresolvedIdx.map(i=>`https://oauth.reddit.com/r/${encodeURIComponent(subs[i])}/about/rules`);
+        const rulesJson = V_fetchAll_(rulesUrls);
+        for(let k=0;k<unresolvedIdx.length;k++){
+          const i = unresolvedIdx[k];
+          const txt = V_textFromRules_(rulesJson[k]);
+          const r = V_classifyText_(txt);
+          if(r && (r.strength>=2 || !results[i])) results[i]={label:r.label, reason:`rules: ${r.reason}`};
+        }
+      }
+      Utilities.sleep(V_SLEEP_MS);
+
+      // Stage 3: stickies for still unresolved/weak
+      let stickiesIdx = [];
+      for(let i=0;i<subs.length;i++){
+        if(!results[i] || results[i].label==='OPTIONAL') stickiesIdx.push(i);
+      }
+      if(V_USE_STICKIES && stickiesIdx.length){
+        const urls = [];
+        stickiesIdx.forEach(i=>{
+          const b=`https://oauth.reddit.com/r/${encodeURIComponent(subs[i])}/about/sticky?num=`;
+          urls.push(b+'1'); urls.push(b+'2');
+        });
+        const stJson = V_fetchAll_(urls);
+        for(let z=0; z<stickiesIdx.length; z++){
+          const i=stickiesIdx[z];
+          const j1 = stJson[2*z], j2 = stJson[2*z+1];
+          const txt = V_textFromStickies_(j1,j2);
+          const r = V_classifyText_(txt);
+          if(r && r.strength>=2) results[i]={label:r.label, reason:`sticky: ${r.reason}`};
+          else if(r && (!results[i] || results[i].label==='OPTIONAL')) results[i]={label:r.label, reason:`sticky: ${r.reason}`};
+        }
+      }
+      Utilities.sleep(V_SLEEP_MS);
+
+      // Stage 4: wiki/verification for still NO/OPTIONAL (weak)
+      if(V_USE_WIKI){
+        const wikiIdx = [];
+        for(let i=0;i<subs.length;i++){
+          if(!results[i] || results[i].label!=='YES') wikiIdx.push(i);
+        }
+        if(wikiIdx.length){
+          const urls = wikiIdx.map(i=>`https://oauth.reddit.com/r/${encodeURIComponent(subs[i])}/wiki/verification`);
+          const wJson = V_fetchAll_(urls);
+          for(let k=0;k<wikiIdx.length;k++){
+            const i = wikiIdx[k];
+            const txt = V_textFromWiki_(wJson[k]);
+            const r = V_classifyText_(txt);
+            if(r && r.strength>=2) results[i]={label:r.label, reason:`wiki: ${r.reason}`};
+            else if(r && (!results[i] || results[i].label==='OPTIONAL')) results[i]={label:r.label, reason:`wiki: ${r.reason}`};
+          }
+        }
+      }
+
+      // Default any null → NO
+      for(let i=0;i<results.length;i++) if(!results[i]) results[i]={label:'NO', reason:''};
+
+      // Bulk write values + notes
+      const vals  = results.map(r=>[r.label]);
+      const notes = results.map(r=>[r.reason || '']);
+      sh.getRange(chunkRows[0], V_COL.VERIF, chunkRows.length, 1).setValues(vals);
+      sh.getRange(chunkRows[0], V_COL.VERIF, chunkRows.length, 1).setNotes(notes);
+
+      idx += chunkRows.length;
+      if(Date.now()>deadline){ p.setProperty('v_idx',String(idx)); V_toast_(`Yield at ${idx}/${rows.length}`,3); return; }
+    }
+
+    p.setProperty('v_idx',String(idx));
+    V_toast_(`Verification ${idx}/${rows.length}`,5);
+    if(idx>=JSON.parse(p.getProperty('v_rows')).length){
+      ['v_rows','v_idx','v_total','v_mode'].forEach(p.deleteProperty, p);
+      V_delTrig_(); V_toast_('Verification: done',3);
+    }
+  } finally { lock.releaseLock(); }
+}
+
+/******** ROW PICKER ********/
+function V_buildRows_(sh,last,mode){
+  const A=sh.getRange(V_START_ROW,V_COL.SUB,last-V_START_ROW+1,1).getValues().flat();
+  const J=sh.getRange(V_START_ROW,V_COL.VERIF,last-V_START_ROW+1,1).getValues().flat();
+  const rows=[];
+  for(let i=0;i<A.length;i++){
+    const sub=String(A[i]||'').trim(); if(!sub) continue;
+    const cur=String(J[i]||'').trim();
+    if(cur.startsWith(V_LOCK_PREFIX)) continue;
+    if(mode==='all' || !cur) rows.push(V_START_ROW+i);
+  }
+  return rows;
+}
+
+/******** TEXT EXTRACTORS ********/
+function V_textFromAbout_(j){
+  const a=j?.data||{};
+  const chunks=[a.public_description,a.description,a.submit_text,a.submit_text_html,a.sidebar].filter(Boolean).map(String);
+  return V_norm_(chunks.join('\n'));
+}
+function V_textFromRules_(j){
+  const arr = j?.rules || j?.data?.rules || [];
+  const chunks=[];
+  for(const r of arr){ [r.short_name,r.description,r.description_html].forEach(v=>{ if(v) chunks.push(String(v)); }); }
+  return V_norm_(chunks.join('\n'));
+}
+function V_textFromStickies_(j1,j2){
+  const take=(j)=> (j?.data?.children||[]).map(x=>x?.data).filter(Boolean)
+    .map(p=>[p.title,p.selftext,p.selftext_html].filter(Boolean).join('\n')).join('\n');
+  return V_norm_([(take(j1)||''),(take(j2)||'')].join('\n'));
+}
+function V_textFromWiki_(j){
+  const w=j?.data||{};
+  const chunks=[w.content_md,w.content_html,w.content].filter(Boolean).map(String);
+  return V_norm_((chunks.join('\n')));
+}
+
+/******** CLASSIFIER (fast & precise) ********/
+// Strength: 3 strong YES, 2 explicit OPTIONAL/NO, 1 weak OPTIONAL (mention), 0 none
+const V_RX_YES = [
+  /\bverification\s+required\b/i,
+  /\bverification\s+is\s+required\b/i,
+  /\bmust\s+(?:be|get|become|complete)\s+verification\b/i,
+  /\byou\s+must\s+(?:be|get|become)\s+verified\b/i,
+  /\bverified\s+(?:users|posters|models|creators)\s+only\b/i,
+  /\bonly\s+verified\s+(?:users|posters|models|creators)\b/i,
+  /\bno\s+unverified\b/i,
+  /\bunverified\s+posts?\s+will\s+be\s+removed\b/i,
+  /\bposts?\s+from\s+unverified\s+\w+\s+will\s+be\s+removed\b/i,
+  /\b(?:submit|posting|to\s+post)\s+.*\brequires?\s+verification\b/i,
+  /\bpost(?:ers)?\s+must\s+be\s+verified\b/i,
+  /\bID[-\s]?verification\s+required\b/i,
+  /\bface\s+verification\s+required\b/i,
+  /\bmust\s+have\s+verified\s+flair\s+to\s+post\b/i
+];
+const V_RX_NO = [
+  /\bverification\s+not\s+required\b/i,
+  /\bno\s+verification\s+required\b/i,
+  /\bnot\s+required\s+to\s+post\b/i,
+  /\byou\s+do\s+not\s+need\s+to\s+be\s+verified\b/i,
+  /\bunverified\s+users\s+may\s+post\b/i
+];
+const V_RX_OPT = [
+  /\bverification\s+optional\b/i,
+  /\bverification\s+is\s+optional\b/i,
+  /\bencouraged\s+to\s+(?:get|be)\s+verified\b/i,
+  /\boptional\s+verification\b/i,
+  /\bget\s+verified\s+for\s+flair\b/i,
+  /\byou\s+can\s+get\s+verified\b/i
+];
+const V_RX_ANY = /\bverif(?:y|ied|ication)\b/i;
+const V_RX_APPROVAL = /\bmod\s+approval\b/i;
+const V_RX_SELLERONLY = /\b(?:seller|vendor|trader)s?\b/i;
+
+function V_classifyText_(text){
+  if(!text) return null;
+
+  // YES (avoid confusing with mod approval)
+  for(const rx of V_RX_YES){
+    const m = text.match(rx);
+    if(m){
+      const ctx = V_ctx_(text,m.index);
+      if(!V_RX_APPROVAL.test(ctx)){
+        const sellersOnly = V_RX_SELLERONLY.test(ctx);
+        return {label: sellersOnly ? 'OPTIONAL' : 'YES', strength:3, reason: V_snip_(text,m.index,m[0].length)};
+      }
+    }
+  }
+
+  // NO explicit
+  for(const rx of V_RX_NO){
+    const m=text.match(rx);
+    if(m) return {label:'NO', strength:2, reason: V_snip_(text,m.index,m[0].length)};
+  }
+
+  // OPTIONAL explicit
+  for(const rx of V_RX_OPT){
+    const m=text.match(rx);
+    if(m) return {label:'OPTIONAL', strength:2, reason: V_snip_(text,m.index,m[0].length)};
+  }
+
+  // Weak OPTIONAL (mention present)
+  if(V_RX_ANY.test(text)) return {label:'OPTIONAL', strength:1, reason:'mentions verification'};
+
+  return null;
+}
+
+/******** TEXT UTILS ********/
+function V_norm_(s){
+  return String(s||'').replace(/<[^>]+>/g,' ').replace(/&[a-z0-9#]+;/gi,' ').replace(/\s+/g,' ').toLowerCase();
+}
+function V_snip_(text,idx,len){ const L=Math.max(0,idx-60), R=Math.min(text.length,idx+len+60); return `“…${text.slice(L,R).trim()}…”`; }
+function V_ctx_(text,idx){ const L=Math.max(0,idx-80), R=Math.min(text.length,idx+80); return text.slice(L,R); }
+
+/******** OAUTH + FETCH (namespaced) ********/
+function V_fetchAll_(urls){
+  if(!urls.length) return [];
+  const token = V_getToken_();
+  const reqs = urls.map(u=>({url:u, headers:{'Authorization':'Bearer '+token,'User-Agent':V_UA}, muteHttpExceptions:true}));
+  const res  = UrlFetchApp.fetchAll(reqs);
+  return res.map(r=>{ try{ if(r.getResponseCode()===200) return JSON.parse(r.getContentText()); }catch(e){} return null; });
+}
+function V_getToken_(){
+  const cache=CacheService.getScriptCache();
+  const hit=cache.get('reddit_token_verif_fast');
+  if(hit) return hit;
+  const resp=UrlFetchApp.fetch('https://www.reddit.com/api/v1/access_token',{
+    method:'post',
+    payload:{grant_type:'client_credentials'},
+    headers:{'Authorization':'Basic '+Utilities.base64Encode(V_CLIENT_ID+':'+V_CLIENT_SECRET),'User-Agent':V_UA},
+    muteHttpExceptions:true
+  });
+  if(resp.getResponseCode()!==200) throw new Error('oauth failed');
+  const data=JSON.parse(resp.getContentText());
+  const token=data.access_token;
+  cache.put('reddit_token_verif_fast', token, Math.max(60,(data.expires_in||3600)-120));
+  return token;
+}
+
+/******** TRIGGERS + TOAST ********/
+function V_ensureTrig_(){
+  const has=ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='V_runBatch_');
+  if(!has) ScriptApp.newTrigger('V_runBatch_').timeBased().everyMinutes(1).create();
+}
+function V_delTrig_(){
+  ScriptApp.getProjectTriggers().forEach(t=>{ if(t.getHandlerFunction()==='V_runBatch_') ScriptApp.deleteTrigger(t); });
+}
+function V_toast_(m,s){ SpreadsheetApp.getActive().toast(m,'Verification',s); }

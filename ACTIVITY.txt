@@ -1,0 +1,397 @@
+/**************************************
+ REDDIT ALL-IN ANALYZER for Google Sheets
+ Focus: “Will my post get views now?”
+ - E: avg_upv (trimmed mean)
+ - F: peak_users (active_now from /about)
+ - G: posts_per_day (windowed, paginated)
+ - H: unique_users (posters ∪ commenters, bots excl.)
+ - I: upv/com_ratio (median(score/(comments+1)))
+ - D: Tier (score)  [S+, S, A, B, C, D, F]
+ **************************************/
+
+/******** CONFIG ********/
+const CLIENT_ID     = 'EqV_ifon5S_P2cs6mN7-Kw';        // <- set your Reddit app client_id
+const CLIENT_SECRET = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';    // <- set your Reddit app client_secret
+const UA            = 'gsheets-reddit-analyzer';
+const START_ROW     = 2;
+
+// Analysis window
+const WINDOW_DAYS   = 5;         // 5-day window
+const MAX_PAGES     = 12;        // pagination for /new (comments = first page only)
+
+// Batch + pacing
+const BATCH_SIZE    = 160;       // rows per execution slice
+const SLEEP_MS      = 220;       // small pause between subs (helps avoid 429)
+
+// Apps Script exec budget (~6m). Stop early and resume via trigger.
+const MAX_EXEC_MS   = 5*60*1000 - 15000; // ~5 min minus safety buffer
+
+// Sheet columns (A=1)
+const COL = {SUB:1, TIER:4, AVG_UPV:5, PEAK:6, PPD:7, UNIQUE:8, RATIO:9};
+
+// ROI-focused weights (sum = 1.00)
+const W = {
+  upvotes: 0.40,   // organic reach per post
+  unique:  0.15,   // breadth of active contributors
+  active:  0.30,   // real-time demand “right now”
+  postsVis:0.10,   // visibility vs. competition (around 50/day)
+  ratio:   0.05    // small quality/sanity signal
+};
+
+// Posts/day “sweet spot” (Gaussian reward)
+const IDEAL_POSTS = 50;          // μ
+const POSTS_SCALE = 35;          // σ
+
+// Robust scaling range (compress outliers)
+const PCTL_LO = 20;              // p20 as lower bound
+const PCTL_HI = 95;              // p95 as upper bound
+
+// Filters for unique users
+const EXCLUDE_USERS = /^(automoderator|\[deleted\])$/i;
+const BOT_SUFFIX    = /bot$/i;
+
+/******** MENU ********/
+function onOpen(){
+  SpreadsheetApp.getUi().createMenu('Reddit Tools')
+    .addItem('Start Analyzer','startAnalyzerAll')
+    .addItem('Status','statusAnalyzerAll')
+    .addItem('Stop','stopAnalyzerAll')
+    .addItem('Recalc tiers only','recalcTiersOnly')
+    .addItem('Reset progress','resetAnalyzerState')
+    .addToUi();
+}
+
+function startAnalyzerAll(){
+  const p = PropertiesService.getDocumentProperties();
+  p.deleteProperty('HALT'); // clear kill-switch
+  ensureTrig_();
+  runBatch_();              // kick off immediately
+}
+
+function statusAnalyzerAll(){
+  const p = PropertiesService.getDocumentProperties();
+  toast_(`Progress ${+(p.getProperty('idx')||0)}/${+(p.getProperty('total')||0)}`,5);
+}
+
+function stopAnalyzerAll(){
+  PropertiesService.getDocumentProperties().setProperty('HALT','1');
+  delTrig_();
+  toast_('Stop requested',3);
+}
+
+function resetAnalyzerState(){
+  const p = PropertiesService.getDocumentProperties();
+  ['rows','idx','total','HALT'].forEach(k=>p.deleteProperty(k));
+  toast_('State reset',3);
+}
+
+/******** BATCH CORE ********/
+function runBatch_(){
+  const lock = LockService.getDocumentLock();
+  if(!lock.tryLock(0)) return;
+  try{
+    const sh = SpreadsheetApp.getActiveSheet();
+    const last = sh.getLastRow();
+    if (last < START_ROW) return;
+
+    const startTs  = Date.now();
+    const deadline = startTs + MAX_EXEC_MS;
+
+    const p = PropertiesService.getDocumentProperties();
+    if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
+
+    if(!p.getProperty('rows')){
+      const rows = buildMissingRows_(sh, last); // only rows with missing E..I
+      p.setProperty('rows', JSON.stringify(rows));
+      p.setProperty('idx','0');
+      p.setProperty('total', String(rows.length));
+      if(!rows.length){ recalcTiersOnly(); delTrig_(); toast_('Nothing to analyze',3); return; }
+    }
+
+    const rows = JSON.parse(p.getProperty('rows')||'[]');
+    let idx    = +(p.getProperty('idx')||0);
+    const end  = Math.min(idx+BATCH_SIZE, rows.length);
+
+    for(let k=idx; k<end; k++){
+      if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
+
+      analyzeOne_(sh, rows[k]);  // write E..I
+      Utilities.sleep(SLEEP_MS);
+
+      if (Date.now() > deadline){ // yield before time limit
+        p.setProperty('idx', String(k+1));
+        toast_(`Yield at ${k+1}/${rows.length}`,3);
+        return; // the trigger will resume soon
+      }
+    }
+
+    idx = end;
+    p.setProperty('idx', String(idx));
+    toast_(`Progress ${idx}/${rows.length}`,5);
+
+    if(idx>=rows.length){
+      // retry rows that failed to fill metrics (transient API issues)
+      const retryRows = buildMissingRows_(sh, last);
+      if (retryRows.length){
+        p.setProperty('rows', JSON.stringify(retryRows));
+        p.setProperty('idx','0');
+        p.setProperty('total', String(retryRows.length));
+        toast_(`Retrying ${retryRows.length} rows`,5);
+      }else{
+        // all metrics populated -> compute tiers once
+        recalcTiersOnly();
+        ['rows','idx','total'].forEach(p.deleteProperty, p);
+        delTrig_();
+        toast_('All done',3);
+      }
+    }
+  } finally { lock.releaseLock(); }
+}
+
+/******** Build the list of rows with missing E..I ********/
+function buildMissingRows_(sh, last){
+  const A = sh.getRange(START_ROW, COL.SUB, last-START_ROW+1, 1).getValues().flat();
+  const M = sh.getRange(START_ROW, COL.AVG_UPV, last-START_ROW+1, 5).getValues();
+  const rows = [];
+  for (let i=0;i<A.length;i++){
+    const sub = String(A[i]||'').trim();
+    if (!sub) continue;
+    const m = M[i];
+    const missing = !(m && m.length===5 && m.every(v => v!=='' && v!==null));
+    if (missing) rows.push(START_ROW+i);
+  }
+  return rows;
+}
+
+/******** Per-sub: collect E..I within WINDOW_DAYS (fast path) ********/
+function analyzeOne_(sh, row){
+  const sub = String(sh.getRange(row, COL.SUB).getValue()||'').replace(/^r\//,'').trim();
+  if(!sub) return;
+
+  const now  = Math.floor(Date.now()/1000);
+  const from = now - WINDOW_DAYS*86400;
+
+  // Parallel: /about, first page of /new, first page of /comments
+  const base = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}`;
+  const [about, firstPosts, firstComments] = oauthJSONFetchAll_([
+    `${base}/about`,
+    `${base}/new?limit=100`,
+    `${base}/comments?limit=100&sort=new`
+  ]);
+
+  const active_now = (about && (about.data?.active_user_count || about.data?.accounts_active)) || 0;
+
+  // Posts: first page + paginate until cutoff (or MAX_PAGES)
+  let posts = ((firstPosts?.data?.children)||[]).map(x=>x.data).filter(Boolean);
+  let after = firstPosts?.data?.after || null;
+  let pages = 1;
+
+  while(after && pages < MAX_PAGES){
+    const url = `${base}/new?limit=100&after=${encodeURIComponent(after)}`;
+    const j = oauthJSON_(url);
+    const batch = (j?.data?.children||[]).map(x=>x.data).filter(Boolean);
+    if(!batch.length) break;
+    posts = posts.concat(batch);
+    after = j.data.after;
+    pages++;
+    const lastUtc = batch[batch.length-1]?.created_utc || 0;
+    if(lastUtc < from) break;
+    Utilities.sleep(150);
+  }
+
+  const postsWindow = posts.filter(p=> (p.created_utc||0) >= from);
+  const postsCount  = postsWindow.length;
+  const postsPerDay = postsCount / WINDOW_DAYS;
+
+  const scores  = [];
+  const ratios  = [];
+  const posters = new Set();
+  for(const p of postsWindow){
+    const sc = isFinite(p.score) ? p.score : 0;
+    const cm = isFinite(p.num_comments) ? p.num_comments : 0;
+    scores.push(sc);
+    if(p.author && !EXCLUDE_USERS.test(p.author) && !BOT_SUFFIX.test(p.author)) posters.add(p.author);
+    ratios.push(sc / (cm + 1)); // Laplace smoothing
+  }
+  const avgUp    = trimmedMean_(scores, 0.10);
+  const ratioMed = median_(ratios);
+
+  // Comments: first page only (big speed gain)
+  const comments = ((firstComments?.data?.children)||[]).map(x=>x.data).filter(Boolean)
+                     .filter(c => (c.created_utc||0) >= from);
+  const commenters = new Set();
+  for(const c of comments){
+    if(c.author && !EXCLUDE_USERS.test(c.author) && !BOT_SUFFIX.test(c.author)) commenters.add(c.author);
+  }
+  const uniqueUsers = new Set([...posters, ...commenters]).size;
+
+  // Write metrics
+  sh.getRange(row, COL.AVG_UPV).setValue(isFinite(avgUp)?avgUp:0);
+  sh.getRange(row, COL.PEAK).setValue(active_now);
+  sh.getRange(row, COL.PPD).setValue(isFinite(postsPerDay)?postsPerDay:0);
+  sh.getRange(row, COL.UNIQUE).setValue(uniqueUsers);
+  sh.getRange(row, COL.RATIO).setValue(isFinite(ratioMed)?ratioMed:0);
+}
+
+/******** Tiers from E..I (robust normalization with quantiles) ********/
+function recalcTiersOnly(){
+  const sh = SpreadsheetApp.getActiveSheet();
+  const last = sh.getLastRow();
+  if(last<START_ROW) return;
+
+  const M = sh.getRange(START_ROW, COL.AVG_UPV, last-START_ROW+1, 5).getValues();
+
+  // Gather for quantiles
+  const upArr=[], uniqArr=[], actArr=[], ratioArr=[], ppdArr=[];
+  for(const r of M){
+    const up=n(r[0]), act=n(r[1]), ppd=n(r[2]), unq=n(r[3]), ra=n(r[4]);
+    if(up>0)   upArr.push(up);
+    if(unq>0)  uniqArr.push(unq);
+    if(act>0)  actArr.push(act);
+    if(ra>0)   ratioArr.push(ra);
+    if(ppd>=0) ppdArr.push(ppd);
+  }
+
+  // Use p20–p95 to compress outliers and widen S/A/B spread
+  const q = {
+    upLo: qtile_(upArr,  PCTL_LO), upHi: qtile_(upArr,  PCTL_HI),
+    uqLo: qtile_(uniqArr,PCTL_LO), uqHi: qtile_(uniqArr,PCTL_HI),
+    acLo: qtile_(actArr, PCTL_LO), acHi: qtile_(actArr, PCTL_HI),
+    raLo: qtile_(ratioArr,PCTL_LO),raHi: qtile_(ratioArr,PCTL_HI)
+  };
+
+  const out=[];
+  for(let i=0;i<M.length;i++){
+    const up=n(M[i][0]), act=n(M[i][1]), ppd=n(M[i][2]), unq=n(M[i][3]), ra=n(M[i][4]);
+
+    const sUp   = scale01_(up,  q.upLo, q.upHi);               // ↑ better
+    const sUniq = scale01_(unq, q.uqLo, q.uqHi);               // ↑
+    const sAct  = scale01_(act, q.acLo, q.acHi);               // ↑
+    const sVis  = gaussian_(ppd, IDEAL_POSTS, POSTS_SCALE);    // peak around 50/day
+    const sRat  = 1 - scale01_(ra, q.raLo, q.raHi);            // ↓ smaller better
+
+    const score = Math.round(100*(W.upvotes*sUp + W.unique*sUniq + W.active*sAct + W.postsVis*sVis + W.ratio*sRat));
+
+    const tier = score>=92 ? 'S+'
+               : score>=85 ? 'S'
+               : score>=75 ? 'A'
+               : score>=65 ? 'B'
+               : score>=50 ? 'C'
+               : score>=35 ? 'D'
+               : 'F';
+
+    out.push([`${tier} (${score})`]);
+
+    const note = `up:${sUp.toFixed(2)} uniq:${sUniq.toFixed(2)} act:${sAct.toFixed(2)} vis:${sVis.toFixed(2)} ratio:${sRat.toFixed(2)}`;
+    sh.getRange(START_ROW+i, COL.TIER).setNote(note);
+  }
+  sh.getRange(START_ROW, COL.TIER, out.length, 1).setValues(out);
+}
+
+/******** OAUTH + FETCH ********/
+function oauthJSON_(url){
+  for(let a=0;a<4;a++){
+    try{
+      const r = UrlFetchApp.fetch(url,{
+        headers:{'Authorization':'Bearer '+getToken_(),'User-Agent':UA},
+        muteHttpExceptions:true
+      });
+      const code = r.getResponseCode();
+      if(code===200) return JSON.parse(r.getContentText());
+      if(code===401) invalidateToken_();
+      if(code===429) Utilities.sleep(1000*(a+1)); // backoff on rate limit
+    }catch(e){}
+    Utilities.sleep(400*(a+1));
+  }
+  return null;
+}
+
+// fetchAll for 3 endpoints in parallel
+function oauthJSONFetchAll_(urls){
+  const token = getToken_();
+  const reqs = urls.map(u=>({url:u, headers:{'Authorization':'Bearer '+token,'User-Agent':UA}, muteHttpExceptions:true}));
+  const res  = UrlFetchApp.fetchAll(reqs);
+  return res.map(r=>{
+    try{
+      if (r.getResponseCode()===200) return JSON.parse(r.getContentText());
+    }catch(e){}
+    return null;
+  });
+}
+
+function getToken_(){
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get('reddit_token');
+  if(hit) return hit;
+  const resp = UrlFetchApp.fetch('https://www.reddit.com/api/v1/access_token',{
+    method:'post',
+    payload:{grant_type:'client_credentials'},
+    headers:{
+      'Authorization':'Basic '+Utilities.base64Encode(CLIENT_ID+':'+CLIENT_SECRET),
+      'User-Agent':UA
+    },
+    muteHttpExceptions:true
+  });
+  if(resp.getResponseCode()!==200) throw new Error('oauth failed');
+  const data = JSON.parse(resp.getContentText());
+  const token = data.access_token;
+  cache.put('reddit_token', token, Math.max(60,(data.expires_in||3600)-120));
+  return token;
+}
+function invalidateToken_(){ CacheService.getScriptCache().remove('reddit_token'); }
+
+/******** UTILS ********/
+function n(v){ const x=Number(v); return isFinite(x)?x:0; }
+
+function median_(arr){
+  if(!arr.length) return 0;
+  const a=arr.slice().sort((x,y)=>x-y);
+  const m=Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+}
+
+function trimmedMean_(arr, alpha){
+  const a = arr.filter(x=>isFinite(x));
+  if(!a.length) return 0;
+  a.sort((x,y)=>x-y);
+  const k = Math.floor(alpha*a.length);
+  const slice = a.slice(k, a.length-k);
+  const s = slice.reduce((t,x)=>t+x,0);
+  return s / Math.max(1, slice.length);
+}
+
+function qtile_(arr, p){
+  if(!arr.length) return 0;
+  const a = arr.slice().sort((x,y)=>x-y);
+  const idx = (p/100)*(a.length-1);
+  const lo = Math.floor(idx), hi = Math.ceil(idx), w = idx-lo;
+  return lo===hi ? a[lo] : a[lo]*(1-w)+a[hi]*w;
+}
+
+function scale01_(x, lo, hi){
+  if(!isFinite(x)) return 0;
+  if(hi<=lo) return 0;
+  const t = (x-lo)/(hi-lo);
+  if(t<0) return 0;
+  if(t>1) return 1;
+  return t;
+}
+
+function gaussian_(x, mu, sigma){
+  if(!isFinite(x)||sigma<=0) return 0;
+  const z = x-mu;
+  return Math.exp(-(z*z)/(2*sigma*sigma));
+}
+
+function ensureTrig_(){
+  const has = ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='runBatch_');
+  if(!has) ScriptApp.newTrigger('runBatch_').timeBased().everyMinutes(1).create();
+}
+
+function delTrig_(){
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(t.getHandlerFunction()==='runBatch_') ScriptApp.deleteTrigger(t);
+  });
+}
+
+function toast_(m,s){ SpreadsheetApp.getActive().toast(m,'Reddit Tools',s); }
