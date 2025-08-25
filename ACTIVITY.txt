@@ -1,27 +1,37 @@
 /**************************************
  REDDIT ALL-IN ANALYZER for Google Sheets
  Focus: “Will my post get views now?”
- - E: avg_upv (trimmed mean)
- - F: peak_users (active_now from /about)
- - G: posts_per_day (windowed, paginated)
- - H: unique_users (posters ∪ commenters, bots excl.)
- - I: upv/com_ratio (median(score/(comments+1)))
- - D: Tier (score)  [S+, S, A, B, C, D, F]
+ Columns:
+ - E: avg_upv         (trimmed mean over last 24h window excluding newest 3h)
+ - F: peak_users      (active_now from /about)  + NOTE: subs, band, momentum
+ - G: posts_per_day   (count in that 24h window)
+ - H: unique_users    (posters ∪ commenters in that 24h; bots/[deleted] excluded)
+ - I: upv/com_ratio   (median(score/(comments+1)) in that 24h window)
+ - D: Tier (score)    [S+, S, A, B, C, D, F]
+
+ Enhancements:
+ - Momentum (3–8h): median(score/hour) over posts aged 3–8h; folded into “active” via 60/40 mix
+ - Size buckets: XS/S/M/L/XL by subscribers; normalize metrics WITHIN band (fair small vs big)
  **************************************/
 
 /******** CONFIG ********/
-const CLIENT_ID     = 'EqV_ifon5S_P2cs6mN7-Kw';        // <- set your Reddit app client_id
-const CLIENT_SECRET = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';    // <- set your Reddit app client_secret
+const CLIENT_ID     = 'EqV_ifon5S_P2cs6mN7-Kw';
+const CLIENT_SECRET = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';
 const UA            = 'gsheets-reddit-analyzer';
 const START_ROW     = 2;
 
-// Analysis window
-const WINDOW_DAYS   = 5;         // 5-day window
-const MAX_PAGES     = 12;        // pagination for /new (comments = first page only)
+// Analysis window — 24h that ends 3h ago: [now-27h, now-3h]
+const EXCLUDE_HOURS_NEW   = 3;      // exclude newest 3 hours
+const AVG_WINDOW_HOURS    = 24;     // measure over the prior 24h
+const MAX_PAGES           = 10;     // paginate /new up to this many pages
+
+// Momentum window (relative to "now"): keep posts aged in [3h, 8h]
+const MOMENTUM_MIN_H      = 3;
+const MOMENTUM_MAX_H      = 8;
 
 // Batch + pacing
-const BATCH_SIZE    = 160;       // rows per execution slice
-const SLEEP_MS      = 220;       // small pause between subs (helps avoid 429)
+const BATCH_SIZE    = 240;          // rows per execution slice
+const SLEEP_MS      = 140;          // small pause between subs (avoid 429)
 
 // Apps Script exec budget (~6m). Stop early and resume via trigger.
 const MAX_EXEC_MS   = 5*60*1000 - 15000; // ~5 min minus safety buffer
@@ -29,22 +39,22 @@ const MAX_EXEC_MS   = 5*60*1000 - 15000; // ~5 min minus safety buffer
 // Sheet columns (A=1)
 const COL = {SUB:1, TIER:4, AVG_UPV:5, PEAK:6, PPD:7, UNIQUE:8, RATIO:9};
 
-// ROI-focused weights (sum = 1.00)
+// Weights (sum = 1.00) — unchanged
 const W = {
-  upvotes: 0.40,   // organic reach per post
+  upvotes: 0.40,   // organic reach per post (avg_upv in 24h window ≥3h old)
   unique:  0.15,   // breadth of active contributors
-  active:  0.30,   // real-time demand “right now”
-  postsVis:0.10,   // visibility vs. competition (around 50/day)
-  ratio:   0.05    // small quality/sanity signal
+  active:  0.30,   // “right now” demand; we blend real-time active + momentum 70/30
+  postsVis:0.10,   // visibility vs. competition today (posts/day over same 24h)
+  ratio:   0.05    // quality/efficiency (lower better)
 };
 
-// Posts/day “sweet spot” (Gaussian reward)
-const IDEAL_POSTS = 50;          // μ
-const POSTS_SCALE = 35;          // σ
+// Posts/day “sweet spot” (Gaussian reward around 50/day)
+const IDEAL_POSTS = 50;  // μ
+const POSTS_SCALE = 35;  // σ
 
-// Robust scaling range (compress outliers)
-const PCTL_LO = 20;              // p20 as lower bound
-const PCTL_HI = 95;              // p95 as upper bound
+// Softer normalization within size-band: p15–p90
+const PCTL_LO = 15;
+const PCTL_HI = 90;
 
 // Filters for unique users
 const EXCLUDE_USERS = /^(automoderator|\[deleted\])$/i;
@@ -115,7 +125,7 @@ function runBatch_(){
     for(let k=idx; k<end; k++){
       if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
 
-      analyzeOne_(sh, rows[k]);  // write E..I
+      analyzeOne_(sh, rows[k]);  // write E..I (+ meta note on F)
       Utilities.sleep(SLEEP_MS);
 
       if (Date.now() > deadline){ // yield before time limit
@@ -138,7 +148,7 @@ function runBatch_(){
         p.setProperty('total', String(retryRows.length));
         toast_(`Retrying ${retryRows.length} rows`,5);
       }else{
-        // all metrics populated -> compute tiers once
+        // all metrics populated -> compute tiers once (band-aware)
         recalcTiersOnly();
         ['rows','idx','total'].forEach(p.deleteProperty, p);
         delTrig_();
@@ -148,7 +158,7 @@ function runBatch_(){
   } finally { lock.releaseLock(); }
 }
 
-/******** Build the list of rows with missing E..I ********/
+/******** Build list of rows with E–I missing ********/
 function buildMissingRows_(sh, last){
   const A = sh.getRange(START_ROW, COL.SUB, last-START_ROW+1, 1).getValues().flat();
   const M = sh.getRange(START_ROW, COL.AVG_UPV, last-START_ROW+1, 5).getValues();
@@ -163,13 +173,16 @@ function buildMissingRows_(sh, last){
   return rows;
 }
 
-/******** Per-sub: collect E..I within WINDOW_DAYS (fast path) ********/
+/******** Per-sub: collect E..I in [now-27h, now-3h] + momentum + band ********/
 function analyzeOne_(sh, row){
   const sub = String(sh.getRange(row, COL.SUB).getValue()||'').replace(/^r\//,'').trim();
   if(!sub) return;
 
-  const now  = Math.floor(Date.now()/1000);
-  const from = now - WINDOW_DAYS*86400;
+  const now       = Math.floor(Date.now()/1000);
+  const windowEnd = now - EXCLUDE_HOURS_NEW*3600;              // now-3h
+  const windowBeg = windowEnd - AVG_WINDOW_HOURS*3600;         // now-27h
+  const momMin    = now - MOMENTUM_MAX_H*3600;                 // now-8h
+  const momMax    = now - MOMENTUM_MIN_H*3600;                 // now-3h
 
   // Parallel: /about, first page of /new, first page of /comments
   const base = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}`;
@@ -180,8 +193,10 @@ function analyzeOne_(sh, row){
   ]);
 
   const active_now = (about && (about.data?.active_user_count || about.data?.accounts_active)) || 0;
+  const subscribers = +((about && about.data?.subscribers) || 0);
+  const band = sizeBand_(subscribers);
 
-  // Posts: first page + paginate until cutoff (or MAX_PAGES)
+  // Posts: first page + paginate until we pass windowBeg or hit MAX_PAGES
   let posts = ((firstPosts?.data?.children)||[]).map(x=>x.data).filter(Boolean);
   let after = firstPosts?.data?.after || null;
   let pages = 1;
@@ -195,14 +210,26 @@ function analyzeOne_(sh, row){
     after = j.data.after;
     pages++;
     const lastUtc = batch[batch.length-1]?.created_utc || 0;
-    if(lastUtc < from) break;
+    if(lastUtc < windowBeg) break; // we’ve gone past the lower bound
     Utilities.sleep(150);
   }
 
-  const postsWindow = posts.filter(p=> (p.created_utc||0) >= from);
-  const postsCount  = postsWindow.length;
-  const postsPerDay = postsCount / WINDOW_DAYS;
+  // Keep only posts in [windowBeg, windowEnd]
+  const postsWindow = posts.filter(p=>{
+    const t = p?.created_utc||0;
+    return t >= windowBeg && t <= windowEnd;
+  });
 
+  // Momentum posts: aged in [3h, 8h]
+  const postsMomentum = posts.filter(p=>{
+    const t = p?.created_utc||0;
+    return t >= momMin && t <= momMax;
+  });
+
+  // posts/day (window is fixed 24h)
+  const postsPerDay = postsWindow.length;
+
+  // avg_upv + ratio + posters
   const scores  = [];
   const ratios  = [];
   const posters = new Set();
@@ -216,76 +243,151 @@ function analyzeOne_(sh, row){
   const avgUp    = trimmedMean_(scores, 0.10);
   const ratioMed = median_(ratios);
 
-  // Comments: first page only (big speed gain)
+  // unique users from comments in same 24h window (first page only)
   const comments = ((firstComments?.data?.children)||[]).map(x=>x.data).filter(Boolean)
-                     .filter(c => (c.created_utc||0) >= from);
+                     .filter(c => {
+                       const t = c?.created_utc||0;
+                       return t >= windowBeg && t <= windowEnd;
+                     });
   const commenters = new Set();
   for(const c of comments){
     if(c.author && !EXCLUDE_USERS.test(c.author) && !BOT_SUFFIX.test(c.author)) commenters.add(c.author);
   }
   const uniqueUsers = new Set([...posters, ...commenters]).size;
 
-  // Write metrics
+  // Momentum rate: median(score/hour) for posts aged 3–8h
+  const momRates = [];
+  for(const p of postsMomentum){
+    const ageH = Math.max(0.001, (now - (p.created_utc||now))/3600);
+    if(ageH >= MOMENTUM_MIN_H && ageH <= MOMENTUM_MAX_H){
+      const sc = isFinite(p.score) ? p.score : 0;
+      momRates.push(sc / ageH);
+    }
+  }
+  const momentum = momRates.length ? median_(momRates) : 0;
+
+  // Write metrics + meta note on column F (peak): subs/band/mom
   sh.getRange(row, COL.AVG_UPV).setValue(isFinite(avgUp)?avgUp:0);
   sh.getRange(row, COL.PEAK).setValue(active_now);
-  sh.getRange(row, COL.PPD).setValue(isFinite(postsPerDay)?postsPerDay:0);
+  sh.getRange(row, COL.PPD).setValue(postsPerDay);
   sh.getRange(row, COL.UNIQUE).setValue(uniqueUsers);
   sh.getRange(row, COL.RATIO).setValue(isFinite(ratioMed)?ratioMed:0);
+
+  const metaNote = `subs=${subscribers}|band=${band}|mom=${Number(momentum).toFixed(3)}`;
+  sh.getRange(row, COL.PEAK).setNote(metaNote);
 }
 
-/******** Tiers from E..I (robust normalization with quantiles) ********/
+/******** Tiers from E..I with band-aware scaling + momentum blend ********/
 function recalcTiersOnly(){
   const sh = SpreadsheetApp.getActiveSheet();
   const last = sh.getLastRow();
   if(last<START_ROW) return;
 
-  const M = sh.getRange(START_ROW, COL.AVG_UPV, last-START_ROW+1, 5).getValues();
+  const rowsN = last - START_ROW + 1;
 
-  // Gather for quantiles
-  const upArr=[], uniqArr=[], actArr=[], ratioArr=[], ppdArr=[];
-  for(const r of M){
-    const up=n(r[0]), act=n(r[1]), ppd=n(r[2]), unq=n(r[3]), ra=n(r[4]);
-    if(up>0)   upArr.push(up);
-    if(unq>0)  uniqArr.push(unq);
-    if(act>0)  actArr.push(act);
-    if(ra>0)   ratioArr.push(ra);
-    if(ppd>=0) ppdArr.push(ppd);
+  // Metrics E..I
+  const M = sh.getRange(START_ROW, COL.AVG_UPV, rowsN, 5).getValues();
+
+  // Peak column notes (F) carry: subs, band, mom
+  const Fnotes = sh.getRange(START_ROW, COL.PEAK, rowsN, 1).getNotes().flat();
+
+  // Prepare per-row meta
+  const bands = new Array(rowsN);
+  const momentumArr = new Array(rowsN);
+  const subsArr = new Array(rowsN);
+
+  for(let i=0;i<rowsN;i++){
+    const parsed = parsePeakMeta_(Fnotes[i]);
+    bands[i] = parsed.band || 'M';
+    momentumArr[i] = parsed.mom || 0;
+    subsArr[i] = parsed.subs || 0;
   }
 
-  // Use p20–p95 to compress outliers and widen S/A/B spread
-  const q = {
-    upLo: qtile_(upArr,  PCTL_LO), upHi: qtile_(upArr,  PCTL_HI),
-    uqLo: qtile_(uniqArr,PCTL_LO), uqHi: qtile_(uniqArr,PCTL_HI),
-    acLo: qtile_(actArr, PCTL_LO), acHi: qtile_(actArr, PCTL_HI),
-    raLo: qtile_(ratioArr,PCTL_LO),raHi: qtile_(ratioArr,PCTL_HI)
-  };
+  // Build band-specific pools for quantiles
+  const pools = {}; // band -> { up:[], uniq:[], act:[], ratio:[], mom:[] }
+  const bandsAll = ['XS','S','M','L','XL'];
+  for(const b of bandsAll) pools[b] = { up:[], uniq:[], act:[], ratio:[], mom:[] };
 
+  for(let i=0;i<rowsN;i++){
+    const r = M[i];
+    const up=n(r[0]), act=n(r[1]), ppd=n(r[2]), unq=n(r[3]), ra=n(r[4]);
+    const b = bands[i] || 'M';
+    if(up>0)   pools[b].up.push(up);
+    if(unq>0)  pools[b].uniq.push(unq);
+    if(act>0)  pools[b].act.push(act);
+    if(ra>0)   pools[b].ratio.push(ra);
+    if(momentumArr[i]>0) pools[b].mom.push(momentumArr[i]);
+  }
+
+  // Compute band quantiles
+  const Q = {}; // band -> q object
+  for(const b of bandsAll){
+    const pb = pools[b];
+    Q[b] = {
+      upLo: qtile_(pb.up,   PCTL_LO), upHi: qtile_(pb.up,   PCTL_HI),
+      uqLo: qtile_(pb.uniq, PCTL_LO), uqHi: qtile_(pb.uniq, PCTL_HI),
+      acLo: qtile_(pb.act,  PCTL_LO), acHi: qtile_(pb.act,  PCTL_HI),
+      raLo: qtile_(pb.ratio,PCTL_LO), raHi: qtile_(pb.ratio,PCTL_HI),
+      moLo: qtile_(pb.mom,  PCTL_LO), moHi: qtile_(pb.mom,  PCTL_HI)
+    };
+  }
+
+  // Score each row using its band’s quantiles; blend momentum into "active"
   const out=[];
-  for(let i=0;i<M.length;i++){
+  for(let i=0;i<rowsN;i++){
     const up=n(M[i][0]), act=n(M[i][1]), ppd=n(M[i][2]), unq=n(M[i][3]), ra=n(M[i][4]);
+    const b = bands[i] || 'M';
+    const q = Q[b];
 
-    const sUp   = scale01_(up,  q.upLo, q.upHi);               // ↑ better
-    const sUniq = scale01_(unq, q.uqLo, q.uqHi);               // ↑
-    const sAct  = scale01_(act, q.acLo, q.acHi);               // ↑
-    const sVis  = gaussian_(ppd, IDEAL_POSTS, POSTS_SCALE);    // peak around 50/day
-    const sRat  = 1 - scale01_(ra, q.raLo, q.raHi);            // ↓ smaller better
+    const sUp   = scale01_(up,  q.upLo, q.upHi);                 // ↑ bigger is better
+    const sUniq = scale01_(unq, q.uqLo, q.uqHi);                 // ↑
+    const sAct0 = scale01_(act, q.acLo, q.acHi);                 // ↑
+    const sMom  = scale01_(momentumArr[i], q.moLo, q.moHi);      // ↑
+    const sAct  = 0.60*sAct0 + 0.40*sMom;                        // blend 60/40
+
+    const sVis  = gaussian_(ppd, IDEAL_POSTS, POSTS_SCALE);      // visibility sweet spot
+    const sRat  = 1 - scale01_(ra, q.raLo, q.raHi);              // ↓ smaller better
 
     const score = Math.round(100*(W.upvotes*sUp + W.unique*sUniq + W.active*sAct + W.postsVis*sVis + W.ratio*sRat));
 
-    const tier = score>=92 ? 'S+'
-               : score>=85 ? 'S'
-               : score>=75 ? 'A'
-               : score>=65 ? 'B'
-               : score>=50 ? 'C'
-               : score>=35 ? 'D'
+    // Calibrated cutoffs (so good subs surface)
+    const tier = score>=90 ? 'S+'
+               : score>=82 ? 'S'
+               : score>=72 ? 'A'
+               : score>=62 ? 'B'
+               : score>=48 ? 'C'
+               : score>=34 ? 'D'
                : 'F';
 
     out.push([`${tier} (${score})`]);
 
-    const note = `up:${sUp.toFixed(2)} uniq:${sUniq.toFixed(2)} act:${sAct.toFixed(2)} vis:${sVis.toFixed(2)} ratio:${sRat.toFixed(2)}`;
+    const note = `band:${b} subs:${subsArr[i]} | up:${sUp.toFixed(2)} uniq:${sUniq.toFixed(2)} act:${sAct.toFixed(2)} (rt:${sAct0.toFixed(2)} mom:${sMom.toFixed(2)}) vis:${sVis.toFixed(2)} ratio:${sRat.toFixed(2)}`;
     sh.getRange(START_ROW+i, COL.TIER).setNote(note);
   }
-  sh.getRange(START_ROW, COL.TIER, out.length, 1).setValues(out);
+  sh.getRange(START_ROW, COL.TIER, rowsN, 1).setValues(out);
+}
+
+/******** Size buckets ********/
+function sizeBand_(subs){
+  if(!isFinite(subs)||subs<=0) return 'M'; // default neutral
+  if(subs < 100000) return 'XS';
+  if(subs < 500000) return 'S';
+  if(subs < 1000000) return 'M';
+  if(subs < 5000000) return 'L';
+  return 'XL';
+}
+
+// Parse meta note on column F: "subs=123|band=M|mom=4.321"
+function parsePeakMeta_(note){
+  const s = String(note||'');
+  const out = { subs:0, band:'M', mom:0 };
+  const subsM = s.match(/(?:^|\|)subs=(\d+)/i);
+  const bandM = s.match(/(?:^|\|)band=([A-Z]+)/i);
+  const momM  = s.match(/(?:^|\|)mom=([0-9.]+)/i);
+  if(subsM) out.subs = +subsM[1];
+  if(bandM) out.band = bandM[1];
+  if(momM)  out.mom  = +momM[1];
+  return out;
 }
 
 /******** OAUTH + FETCH ********/
@@ -306,7 +408,7 @@ function oauthJSON_(url){
   return null;
 }
 
-// fetchAll for 3 endpoints in parallel
+// fetchAll for /about, /new, /comments in parallel
 function oauthJSONFetchAll_(urls){
   const token = getToken_();
   const reqs = urls.map(u=>({url:u, headers:{'Authorization':'Bearer '+token,'User-Agent':UA}, muteHttpExceptions:true}));
@@ -381,6 +483,11 @@ function gaussian_(x, mu, sigma){
   if(!isFinite(x)||sigma<=0) return 0;
   const z = x-mu;
   return Math.exp(-(z*z)/(2*sigma*sigma));
+}
+
+/******** MAINTENANCE (run once to clear old triggers) ********/
+function killAllTriggersOnce(){
+  ScriptApp.getProjectTriggers().forEach(ScriptApp.deleteTrigger);
 }
 
 function ensureTrig_(){
