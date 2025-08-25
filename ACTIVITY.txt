@@ -1,17 +1,18 @@
 /**************************************
  REDDIT ALL-IN ANALYZER for Google Sheets
  Focus: “Will my post get views now?”
- Columns:
- - E: avg_upv         (trimmed mean over last 24h window excluding newest 3h)
- - F: peak_users      (active_now from /about)  + NOTE: subs, band, momentum
- - G: posts_per_day   (count in that 24h window)
- - H: unique_users    (posters ∪ commenters in that 24h; bots/[deleted] excluded)
- - I: upv/com_ratio   (median(score/(comments+1)) in that 24h window)
+ Cols (A=1):
+ - E: avg_upv         (trimmed mean pe fereastra [now-3h-AVG_WINDOW, now-3h])
+ - F: peak_users      (active_now din /about)  + NOTE: subs, band, momentum
+ - G: posts_per_day   (număr/zi în fereastra selectată)
+ - H: unique_users    (posteri ∪ comentatori în fereastră; bots/[deleted] excl.)
+ - I: upv/com_ratio   (median(score/(comments+1)) în fereastră)
  - D: Tier (score)    [S+, S, A, B, C, D, F]
 
  Enhancements:
- - Momentum (3–8h): median(score/hour) over posts aged 3–8h; folded into “active” via 60/40 mix
- - Size buckets: XS/S/M/L/XL by subscribers; normalize metrics WITHIN band (fair small vs big)
+ - Momentum (3–8h): median(score/hour) pentru postări cu vârsta în [3h,8h];
+   se combină în “active” prin 60/40 (rt/mom).
+ - Size buckets: XS/S/M/L/XL (după subscribers); normalizare în bandă.
  **************************************/
 
 /******** CONFIG ********/
@@ -20,43 +21,46 @@ const CLIENT_SECRET = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';
 const UA            = 'gsheets-reddit-analyzer';
 const START_ROW     = 2;
 
-// Analysis window — 24h that ends 3h ago: [now-27h, now-3h]
-const EXCLUDE_HOURS_NEW   = 3;      // exclude newest 3 hours
-const AVG_WINDOW_HOURS    = 24;     // measure over the prior 24h
-const MAX_PAGES           = 10;     // paginate /new up to this many pages
+// Fereastră de analiză — se termină cu 3h în urmă: [now-EXCLUDE-AVG_WINDOW, now-EXCLUDE]
+const EXCLUDE_HOURS_NEW   = 3;         // exclude cele mai noi 3 ore
+const AVG_WINDOW_HOURS    = 24*5;      // 5 zile (modifică la nevoie)
+const MAX_PAGES           = 20;        // paginare /new (100/poste/pagină)
 
-// Momentum window (relative to "now"): keep posts aged in [3h, 8h]
+// Momentum (relativ la “acum”)
 const MOMENTUM_MIN_H      = 3;
 const MOMENTUM_MAX_H      = 8;
 
-// Batch + pacing
-const BATCH_SIZE    = 240;          // rows per execution slice
-const SLEEP_MS      = 140;          // small pause between subs (avoid 429)
+// Comentarii paginate
+const COMMENTS_MAX_PAGES  = 8;         // ~800 comentarii max; crește cu atenție
 
-// Apps Script exec budget (~6m). Stop early and resume via trigger.
-const MAX_EXEC_MS   = 5*60*1000 - 15000; // ~5 min minus safety buffer
+// Batch + pacing
+const BATCH_SIZE          = 240;       // rânduri per execuție
+const SLEEP_MS            = 140;       // pauză scurtă între subreddits (evită 429)
+
+// Buget execuție Apps Script (~6m)
+const MAX_EXEC_MS         = 5*60*1000 - 15000;
 
 // Sheet columns (A=1)
 const COL = {SUB:1, TIER:4, AVG_UPV:5, PEAK:6, PPD:7, UNIQUE:8, RATIO:9};
 
-// Weights (sum = 1.00) — unchanged
+// Weights (sum = 1.00)
 const W = {
-  upvotes: 0.40,   // organic reach per post (avg_upv in 24h window ≥3h old)
-  unique:  0.15,   // breadth of active contributors
-  active:  0.30,   // “right now” demand; we blend real-time active + momentum 70/30
-  postsVis:0.10,   // visibility vs. competition today (posts/day over same 24h)
-  ratio:   0.05    // quality/efficiency (lower better)
+  upvotes: 0.40,
+  unique:  0.15,
+  active:  0.30,   // “right now” + momentum (60/40)
+  postsVis:0.10,
+  ratio:   0.05
 };
 
-// Posts/day “sweet spot” (Gaussian reward around 50/day)
-const IDEAL_POSTS = 50;  // μ
-const POSTS_SCALE = 35;  // σ
+// Posts/day “sweet spot”
+const IDEAL_POSTS = 50;   // μ (pe zi)
+const POSTS_SCALE = 35;   // σ
 
-// Softer normalization within size-band: p15–p90
+// Normalizare în bandă: p15–p90 (soft)
 const PCTL_LO = 15;
 const PCTL_HI = 90;
 
-// Filters for unique users
+// Filtre useri
 const EXCLUDE_USERS = /^(automoderator|\[deleted\])$/i;
 const BOT_SUFFIX    = /bot$/i;
 
@@ -73,9 +77,9 @@ function onOpen(){
 
 function startAnalyzerAll(){
   const p = PropertiesService.getDocumentProperties();
-  p.deleteProperty('HALT'); // clear kill-switch
+  p.deleteProperty('HALT');
   ensureTrig_();
-  runBatch_();              // kick off immediately
+  runBatch_();
 }
 
 function statusAnalyzerAll(){
@@ -111,7 +115,7 @@ function runBatch_(){
     if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
 
     if(!p.getProperty('rows')){
-      const rows = buildMissingRows_(sh, last); // only rows with missing E..I
+      const rows = buildMissingRows_(sh, last); // doar rânduri cu E..I lipsă
       p.setProperty('rows', JSON.stringify(rows));
       p.setProperty('idx','0');
       p.setProperty('total', String(rows.length));
@@ -125,13 +129,13 @@ function runBatch_(){
     for(let k=idx; k<end; k++){
       if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
 
-      analyzeOne_(sh, rows[k]);  // write E..I (+ meta note on F)
+      analyzeOne_(sh, rows[k]);  // scrie E..I și nota pe F
       Utilities.sleep(SLEEP_MS);
 
-      if (Date.now() > deadline){ // yield before time limit
+      if (Date.now() > deadline){
         p.setProperty('idx', String(k+1));
         toast_(`Yield at ${k+1}/${rows.length}`,3);
-        return; // the trigger will resume soon
+        return;
       }
     }
 
@@ -140,7 +144,6 @@ function runBatch_(){
     toast_(`Progress ${idx}/${rows.length}`,5);
 
     if(idx>=rows.length){
-      // retry rows that failed to fill metrics (transient API issues)
       const retryRows = buildMissingRows_(sh, last);
       if (retryRows.length){
         p.setProperty('rows', JSON.stringify(retryRows));
@@ -148,7 +151,6 @@ function runBatch_(){
         p.setProperty('total', String(retryRows.length));
         toast_(`Retrying ${retryRows.length} rows`,5);
       }else{
-        // all metrics populated -> compute tiers once (band-aware)
         recalcTiersOnly();
         ['rows','idx','total'].forEach(p.deleteProperty, p);
         delTrig_();
@@ -173,18 +175,18 @@ function buildMissingRows_(sh, last){
   return rows;
 }
 
-/******** Per-sub: collect E..I in [now-27h, now-3h] + momentum + band ********/
+/******** Per-sub: collect E..I în fereastra 5 zile + momentum + band ********/
 function analyzeOne_(sh, row){
   const sub = String(sh.getRange(row, COL.SUB).getValue()||'').replace(/^r\//,'').trim();
   if(!sub) return;
 
   const now       = Math.floor(Date.now()/1000);
   const windowEnd = now - EXCLUDE_HOURS_NEW*3600;              // now-3h
-  const windowBeg = windowEnd - AVG_WINDOW_HOURS*3600;         // now-27h
+  const windowBeg = windowEnd - AVG_WINDOW_HOURS*3600;         // now-3h-AVG_WINDOW
   const momMin    = now - MOMENTUM_MAX_H*3600;                 // now-8h
   const momMax    = now - MOMENTUM_MIN_H*3600;                 // now-3h
 
-  // Parallel: /about, first page of /new, first page of /comments
+  // Parallel: /about, prima pagină /new, prima pagină /comments
   const base = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}`;
   const [about, firstPosts, firstComments] = oauthJSONFetchAll_([
     `${base}/about`,
@@ -192,44 +194,45 @@ function analyzeOne_(sh, row){
     `${base}/comments?limit=100&sort=new`
   ]);
 
-  const active_now = (about && (about.data?.active_user_count || about.data?.accounts_active)) || 0;
+  const active_now  = (about && (about.data?.active_user_count || about.data?.accounts_active)) || 0;
   const subscribers = +((about && about.data?.subscribers) || 0);
-  const band = sizeBand_(subscribers);
+  const band        = sizeBand_(subscribers);
 
-  // Posts: first page + paginate until we pass windowBeg or hit MAX_PAGES
+  // Paginare postări până coborâm sub windowBeg sau epuizăm paginile
   let posts = ((firstPosts?.data?.children)||[]).map(x=>x.data).filter(Boolean);
   let after = firstPosts?.data?.after || null;
   let pages = 1;
 
   while(after && pages < MAX_PAGES){
     const url = `${base}/new?limit=100&after=${encodeURIComponent(after)}`;
-    const j = oauthJSON_(url);
+    const j   = oauthJSON_(url);
     const batch = (j?.data?.children||[]).map(x=>x.data).filter(Boolean);
     if(!batch.length) break;
     posts = posts.concat(batch);
     after = j.data.after;
     pages++;
     const lastUtc = batch[batch.length-1]?.created_utc || 0;
-    if(lastUtc < windowBeg) break; // we’ve gone past the lower bound
-    Utilities.sleep(150);
+    if(lastUtc < windowBeg) break;
+    Utilities.sleep(120);
   }
 
-  // Keep only posts in [windowBeg, windowEnd]
+  // Fereastra de analiză
   const postsWindow = posts.filter(p=>{
     const t = p?.created_utc||0;
     return t >= windowBeg && t <= windowEnd;
   });
 
-  // Momentum posts: aged in [3h, 8h]
+  // Momentum: postări cu vârsta 3–8h
   const postsMomentum = posts.filter(p=>{
     const t = p?.created_utc||0;
-    return t >= momMin && t <= momMax;
+    return t >= (now - MOMENTUM_MAX_H*3600) && t <= (now - MOMENTUM_MIN_H*3600);
   });
 
-  // posts/day (window is fixed 24h)
-  const postsPerDay = postsWindow.length;
+  // posts_per_day (medie/zi pe fereastră)
+  const days = AVG_WINDOW_HOURS / 24;
+  const postsPerDay = postsWindow.length / days;
 
-  // avg_upv + ratio + posters
+  // avg_upv + ratio + autori postări
   const scores  = [];
   const ratios  = [];
   const posters = new Set();
@@ -238,24 +241,41 @@ function analyzeOne_(sh, row){
     const cm = isFinite(p.num_comments) ? p.num_comments : 0;
     scores.push(sc);
     if(p.author && !EXCLUDE_USERS.test(p.author) && !BOT_SUFFIX.test(p.author)) posters.add(p.author);
-    ratios.push(sc / (cm + 1)); // Laplace smoothing
+    ratios.push(sc / (cm + 1));
   }
   const avgUp    = trimmedMean_(scores, 0.10);
   const ratioMed = median_(ratios);
 
-  // unique users from comments in same 24h window (first page only)
-  const comments = ((firstComments?.data?.children)||[]).map(x=>x.data).filter(Boolean)
-                     .filter(c => {
-                       const t = c?.created_utc||0;
-                       return t >= windowBeg && t <= windowEnd;
-                     });
+  // Comentarii paginate în aceeași fereastră (nu doar prima pagină)
+  let commentsAll = ((firstComments?.data?.children)||[]).map(x=>x.data).filter(Boolean);
+  let afterC = firstComments?.data?.after || null;
+  let cPages = 1;
+
+  while (afterC && cPages < COMMENTS_MAX_PAGES) {
+    const urlC = `${base}/comments?limit=100&sort=new&after=${encodeURIComponent(afterC)}`;
+    const jC   = oauthJSON_(urlC);
+    const batchC = (jC?.data?.children||[]).map(x=>x.data).filter(Boolean);
+    if (!batchC.length) break;
+    commentsAll = commentsAll.concat(batchC);
+    afterC = jC.data.after;
+    cPages++;
+    const lastUtcC = batchC[batchC.length-1]?.created_utc || 0;
+    if (lastUtcC < windowBeg) break;
+    Utilities.sleep(100);
+  }
+
+  const comments = commentsAll.filter(c => {
+    const t = c?.created_utc||0;
+    return t >= windowBeg && t <= windowEnd;
+  });
+
   const commenters = new Set();
   for(const c of comments){
     if(c.author && !EXCLUDE_USERS.test(c.author) && !BOT_SUFFIX.test(c.author)) commenters.add(c.author);
   }
   const uniqueUsers = new Set([...posters, ...commenters]).size;
 
-  // Momentum rate: median(score/hour) for posts aged 3–8h
+  // Momentum rate: median(score/hour) pentru 3–8h
   const momRates = [];
   for(const p of postsMomentum){
     const ageH = Math.max(0.001, (now - (p.created_utc||now))/3600);
@@ -266,18 +286,20 @@ function analyzeOne_(sh, row){
   }
   const momentum = momRates.length ? median_(momRates) : 0;
 
-  // Write metrics + meta note on column F (peak): subs/band/mom
-  sh.getRange(row, COL.AVG_UPV).setValue(isFinite(avgUp)?avgUp:0);
-  sh.getRange(row, COL.PEAK).setValue(active_now);
-  sh.getRange(row, COL.PPD).setValue(postsPerDay);
-  sh.getRange(row, COL.UNIQUE).setValue(uniqueUsers);
-  sh.getRange(row, COL.RATIO).setValue(isFinite(ratioMed)?ratioMed:0);
+  // Scriere în bloc (E..I) + notă pe F
+  sh.getRange(row, COL.AVG_UPV, 1, 5).setValues([[
+    isFinite(avgUp)?avgUp:0,
+    active_now,
+    isFinite(postsPerDay)?postsPerDay:0,
+    uniqueUsers,
+    isFinite(ratioMed)?ratioMed:0
+  ]]);
 
   const metaNote = `subs=${subscribers}|band=${band}|mom=${Number(momentum).toFixed(3)}`;
   sh.getRange(row, COL.PEAK).setNote(metaNote);
 }
 
-/******** Tiers from E..I with band-aware scaling + momentum blend ********/
+/******** Tiers: band-aware scaling + momentum blend (60/40) ********/
 function recalcTiersOnly(){
   const sh = SpreadsheetApp.getActiveSheet();
   const last = sh.getLastRow();
@@ -285,13 +307,9 @@ function recalcTiersOnly(){
 
   const rowsN = last - START_ROW + 1;
 
-  // Metrics E..I
-  const M = sh.getRange(START_ROW, COL.AVG_UPV, rowsN, 5).getValues();
+  const M      = sh.getRange(START_ROW, COL.AVG_UPV, rowsN, 5).getValues(); // E..I
+  const Fnotes = sh.getRange(START_ROW, COL.PEAK,    rowsN, 1).getNotes().flat();
 
-  // Peak column notes (F) carry: subs, band, mom
-  const Fnotes = sh.getRange(START_ROW, COL.PEAK, rowsN, 1).getNotes().flat();
-
-  // Prepare per-row meta
   const bands = new Array(rowsN);
   const momentumArr = new Array(rowsN);
   const subsArr = new Array(rowsN);
@@ -303,54 +321,72 @@ function recalcTiersOnly(){
     subsArr[i] = parsed.subs || 0;
   }
 
-  // Build band-specific pools for quantiles
-  const pools = {}; // band -> { up:[], uniq:[], act:[], ratio:[], mom:[] }
+  // Pools per band + pools globale (fallback)
   const bandsAll = ['XS','S','M','L','XL'];
-  for(const b of bandsAll) pools[b] = { up:[], uniq:[], act:[], ratio:[], mom:[] };
+  const pools = {}; for(const b of bandsAll) pools[b] = { up:[], uniq:[], act:[], ratio:[], mom:[] };
+  const global = { up:[], uniq:[], act:[], ratio:[], mom:[] };
 
   for(let i=0;i<rowsN;i++){
-    const r = M[i];
-    const up=n(r[0]), act=n(r[1]), ppd=n(r[2]), unq=n(r[3]), ra=n(r[4]);
-    const b = bands[i] || 'M';
-    if(up>0)   pools[b].up.push(up);
-    if(unq>0)  pools[b].uniq.push(unq);
-    if(act>0)  pools[b].act.push(act);
-    if(ra>0)   pools[b].ratio.push(ra);
-    if(momentumArr[i]>0) pools[b].mom.push(momentumArr[i]);
+    const r  = M[i];
+    const up = n(r[0]), act=n(r[1]), ppd=n(r[2]), unq=n(r[3]), ra=n(r[4]); // ppd folosit doar la gaussian
+    const b  = bands[i] || 'M';
+    if(up>0){ pools[b].up.push(up); global.up.push(up); }
+    if(unq>0){ pools[b].uniq.push(unq); global.uniq.push(unq); }
+    if(act>0){ pools[b].act.push(act); global.act.push(act); }
+    if(ra>0){ pools[b].ratio.push(ra); global.ratio.push(ra); }
+    if(momentumArr[i]>0){ pools[b].mom.push(momentumArr[i]); global.mom.push(momentumArr[i]); }
   }
 
-  // Compute band quantiles
-  const Q = {}; // band -> q object
+  const GQ = {
+    upLo: qtile_(global.up,   PCTL_LO), upHi: qtile_(global.up,   PCTL_HI),
+    uqLo: qtile_(global.uniq, PCTL_LO), uqHi: qtile_(global.uniq, PCTL_HI),
+    acLo: qtile_(global.act,  PCTL_LO), acHi: qtile_(global.act,  PCTL_HI),
+    raLo: qtile_(global.ratio,PCTL_LO), raHi: qtile_(global.ratio,PCTL_HI),
+    moLo: qtile_(global.mom,  PCTL_LO), moHi: qtile_(global.mom,  PCTL_HI)
+  };
+
+  const Q = {};
   for(const b of bandsAll){
     const pb = pools[b];
-    Q[b] = {
+    const qb = {
       upLo: qtile_(pb.up,   PCTL_LO), upHi: qtile_(pb.up,   PCTL_HI),
       uqLo: qtile_(pb.uniq, PCTL_LO), uqHi: qtile_(pb.uniq, PCTL_HI),
       acLo: qtile_(pb.act,  PCTL_LO), acHi: qtile_(pb.act,  PCTL_HI),
       raLo: qtile_(pb.ratio,PCTL_LO), raHi: qtile_(pb.ratio,PCTL_HI),
       moLo: qtile_(pb.mom,  PCTL_LO), moHi: qtile_(pb.mom,  PCTL_HI)
     };
+    // fallback dacă banda e prea subțire
+    Q[b] = {
+      upLo: isFinite(qb.upLo)&&isFinite(qb.upHi)&&qb.upHi>qb.upLo ? qb.upLo : GQ.upLo,
+      upHi: isFinite(qb.upLo)&&isFinite(qb.upHi)&&qb.upHi>qb.upLo ? qb.upHi : GQ.upHi,
+      uqLo: isFinite(qb.uqLo)&&isFinite(qb.uqHi)&&qb.uqHi>qb.uqLo ? qb.uqLo : GQ.uqLo,
+      uqHi: isFinite(qb.uqLo)&&isFinite(qb.uqHi)&&qb.uqHi>qb.uqLo ? qb.uqHi : GQ.uqHi,
+      acLo: isFinite(qb.acLo)&&isFinite(qb.acHi)&&qb.acHi>qb.acLo ? qb.acLo : GQ.acLo,
+      acHi: isFinite(qb.acLo)&&isFinite(qb.acHi)&&qb.acHi>qb.acLo ? qb.acHi : GQ.acHi,
+      raLo: isFinite(qb.raLo)&&isFinite(qb.raHi)&&qb.raHi>qb.raLo ? qb.raLo : GQ.raLo,
+      raHi: isFinite(qb.raLo)&&isFinite(qb.raHi)&&qb.raHi>qb.raLo ? qb.raHi : GQ.raHi,
+      moLo: isFinite(qb.moLo)&&isFinite(qb.moHi)&&qb.moHi>qb.moLo ? qb.moLo : GQ.moLo,
+      moHi: isFinite(qb.moLo)&&isFinite(qb.moHi)&&qb.moHi>qb.moLo ? qb.moHi : GQ.moHi
+    };
   }
 
-  // Score each row using its band’s quantiles; blend momentum into "active"
-  const out=[];
+  const out = [];
   for(let i=0;i<rowsN;i++){
     const up=n(M[i][0]), act=n(M[i][1]), ppd=n(M[i][2]), unq=n(M[i][3]), ra=n(M[i][4]);
     const b = bands[i] || 'M';
     const q = Q[b];
 
-    const sUp   = scale01_(up,  q.upLo, q.upHi);                 // ↑ bigger is better
-    const sUniq = scale01_(unq, q.uqLo, q.uqHi);                 // ↑
-    const sAct0 = scale01_(act, q.acLo, q.acHi);                 // ↑
-    const sMom  = scale01_(momentumArr[i], q.moLo, q.moHi);      // ↑
-    const sAct  = 0.60*sAct0 + 0.40*sMom;                        // blend 60/40
+    const sUp   = scale01_(up,  q.upLo, q.upHi);            // ↑
+    const sUniq = scale01_(unq, q.uqLo, q.uqHi);            // ↑
+    const sAct0 = scale01_(act, q.acLo, q.acHi);            // ↑ (real-time)
+    const sMom  = scale01_(momentumArr[i], q.moLo, q.moHi); // ↑
+    const sAct  = 0.60*sAct0 + 0.40*sMom;                   // 60/40
 
-    const sVis  = gaussian_(ppd, IDEAL_POSTS, POSTS_SCALE);      // visibility sweet spot
-    const sRat  = 1 - scale01_(ra, q.raLo, q.raHi);              // ↓ smaller better
+    const sVis  = gaussian_(ppd, IDEAL_POSTS, POSTS_SCALE); // sweet spot
+    const sRat  = 1 - scale01_(ra, q.raLo, q.raHi);         // ↓
 
     const score = Math.round(100*(W.upvotes*sUp + W.unique*sUniq + W.active*sAct + W.postsVis*sVis + W.ratio*sRat));
 
-    // Calibrated cutoffs (so good subs surface)
     const tier = score>=90 ? 'S+'
                : score>=82 ? 'S'
                : score>=72 ? 'A'
@@ -369,15 +405,15 @@ function recalcTiersOnly(){
 
 /******** Size buckets ********/
 function sizeBand_(subs){
-  if(!isFinite(subs)||subs<=0) return 'M'; // default neutral
-  if(subs < 100000) return 'XS';
-  if(subs < 500000) return 'S';
+  if(!isFinite(subs)||subs<=0) return 'M';
+  if(subs < 100000)  return 'XS';
+  if(subs < 500000)  return 'S';
   if(subs < 1000000) return 'M';
   if(subs < 5000000) return 'L';
   return 'XL';
 }
 
-// Parse meta note on column F: "subs=123|band=M|mom=4.321"
+// Parse meta note pe F: "subs=123|band=M|mom=4.321"
 function parsePeakMeta_(note){
   const s = String(note||'');
   const out = { subs:0, band:'M', mom:0 };
@@ -401,14 +437,14 @@ function oauthJSON_(url){
       const code = r.getResponseCode();
       if(code===200) return JSON.parse(r.getContentText());
       if(code===401) invalidateToken_();
-      if(code===429) Utilities.sleep(1000*(a+1)); // backoff on rate limit
+      if(code===429) Utilities.sleep(900*(a+1));
     }catch(e){}
-    Utilities.sleep(400*(a+1));
+    Utilities.sleep(300*(a+1));
   }
   return null;
 }
 
-// fetchAll for /about, /new, /comments in parallel
+// fetchAll pentru /about, /new, /comments în paralel
 function oauthJSONFetchAll_(urls){
   const token = getToken_();
   const reqs = urls.map(u=>({url:u, headers:{'Authorization':'Bearer '+token,'User-Agent':UA}, muteHttpExceptions:true}));
@@ -472,7 +508,7 @@ function qtile_(arr, p){
 
 function scale01_(x, lo, hi){
   if(!isFinite(x)) return 0;
-  if(hi<=lo) return 0;
+  if(!(isFinite(lo)&&isFinite(hi)) || hi<=lo) return 0;
   const t = (x-lo)/(hi-lo);
   if(t<0) return 0;
   if(t>1) return 1;
@@ -485,7 +521,7 @@ function gaussian_(x, mu, sigma){
   return Math.exp(-(z*z)/(2*sigma*sigma));
 }
 
-/******** MAINTENANCE (run once to clear old triggers) ********/
+/******** MAINTENANCE (rulezi o dată dacă ai trigger-e rămase) ********/
 function killAllTriggersOnce(){
   ScriptApp.getProjectTriggers().forEach(ScriptApp.deleteTrigger);
 }
