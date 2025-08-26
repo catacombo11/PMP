@@ -1,397 +1,479 @@
 /**************************************
- REDDIT ALL-IN ANALYZER for Google Sheets
- Focus: “Will my post get views now?”
- - E: avg_upv (trimmed mean)
- - F: peak_users (active_now from /about)
- - G: posts_per_day (windowed, paginated)
- - H: unique_users (posters ∪ commenters, bots excl.)
- - I: upv/com_ratio (median(score/(comments+1)))
- - D: Tier (score)  [S+, S, A, B, C, D, F]
- **************************************/
+  KREQ — KARMA REQUIREMENT ANALYZER (Column K)
+  Minim total karma pentru un USER LIVE cu post SURVIVOR (≥3h),
+  scanând EXACT 200 postări de la prima ≥3h.
+
+  Robust:
+   • Scriere imediată pe rând doar când avem rezultat.
+   • Time-budget: cedează înainte de limită și reia același rând.
+   • Listing pipeline: oauth → api → old → www (+over18), cu fallback real.
+   • /user/.../about: cache + retry/backoff + chunk mic.
+   • Diagnoze clare: ok / too hot / pagelimit / forbidden / notfound / quarantined / ratelimited.
+   • Watchdog, resume sigur, toleră 3k+ rânduri.
+**************************************/
 
 /******** CONFIG ********/
-const CLIENT_ID     = 'EqV_ifon5S_P2cs6mN7-Kw';        // <- set your Reddit app client_id
-const CLIENT_SECRET = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';    // <- set your Reddit app client_secret
-const UA            = 'gsheets-reddit-analyzer';
-const START_ROW     = 2;
+const KREQ_CLIENT_ID      = 'EqV_ifon5S_P2cs6mN7-Kw';
+const KREQ_CLIENT_SECRET  = 'h7aq_eNM7_LT1AM5Ihrb9ds4u5BcOQ';
+const KREQ_UA             = 'gsheets-karma-req/v12';
+const KREQ_START_ROW      = 2;
 
-// Analysis window
-const WINDOW_DAYS   = 5;         // 5-day window
-const MAX_PAGES     = 12;        // pagination for /new (comments = first page only)
+// Scan window
+const KREQ_SCAN_COUNT     = 200;
+const KREQ_MIN_AGE_SEC    = 3*3600;
+const KREQ_PAGE_LIMIT     = 18;
 
 // Batch + pacing
-const BATCH_SIZE    = 160;       // rows per execution slice
-const SLEEP_MS      = 220;       // small pause between subs (helps avoid 429)
+const KREQ_BATCH_SIZE     = 90;                    // mic pentru a garanta yield
+const KREQ_MAX_EXEC_MS    = 5*60*1000 - 20000;     // buffer mare
+const KREQ_SLEEP_MS       = 110;
+const KREQ_PAGE_SLEEP_MS  = 70;
+const KREQ_CHUNK_SLEEP_MS = 140;
 
-// Apps Script exec budget (~6m). Stop early and resume via trigger.
-const MAX_EXEC_MS   = 5*60*1000 - 15000; // ~5 min minus safety buffer
+// /user/.../about
+const KREQ_AUTHOR_CHUNK   = 10;
+const KREQ_USER_CACHE_TTL = 6*3600;
 
-// Sheet columns (A=1)
-const COL = {SUB:1, TIER:4, AVG_UPV:5, PEAK:6, PPD:7, UNIQUE:8, RATIO:9};
+// Coloane (A=1)
+const KREQ_COL = { SUB:1, KARMA:11 };
 
-// ROI-focused weights (sum = 1.00)
-const W = {
-  upvotes: 0.40,   // organic reach per post
-  unique:  0.15,   // breadth of active contributors
-  active:  0.30,   // real-time demand “right now”
-  postsVis:0.10,   // visibility vs. competition (around 50/day)
-  ratio:   0.05    // small quality/sanity signal
+// Excluderi
+const KREQ_EXCLUDE_USERS = /^(automoderator|\[deleted\])$/i;
+const KREQ_BOT_SUFFIX    = /bot$/i;
+
+/******** State keys ********/
+const KREQ_PROP = {
+  rows:      'kreq_rows',
+  idx:       'kreq_idx',
+  total:     'kreq_total',
+  halt:      'kreq_halt',
+  mode:      'kreq_mode',
+  sheetName: 'kreq_sheet'
 };
-
-// Posts/day “sweet spot” (Gaussian reward)
-const IDEAL_POSTS = 50;          // μ
-const POSTS_SCALE = 35;          // σ
-
-// Robust scaling range (compress outliers)
-const PCTL_LO = 20;              // p20 as lower bound
-const PCTL_HI = 95;              // p95 as upper bound
-
-// Filters for unique users
-const EXCLUDE_USERS = /^(automoderator|\[deleted\])$/i;
-const BOT_SUFFIX    = /bot$/i;
+const KREQ_TOKEN_KEY   = 'kreq_token';
+const KREQ_USER_PREFIX = 'kreq_user_';
+const KREQ_LAST_ERR    = 'kreq_last_err'; // diag minimal
 
 /******** MENU ********/
-function onOpen(){
-  SpreadsheetApp.getUi().createMenu('Reddit Tools')
-    .addItem('Start Analyzer','startAnalyzerAll')
-    .addItem('Status','statusAnalyzerAll')
-    .addItem('Stop','stopAnalyzerAll')
-    .addItem('Recalc tiers only','recalcTiersOnly')
-    .addItem('Reset progress','resetAnalyzerState')
+function kreq_onOpen(){
+  SpreadsheetApp.getUi().createMenu('Karma Tools (K)')
+    .addItem('Start (ALL rows)',    'kreq_startAll')
+    .addItem('Start (BLANKS only)', 'kreq_startBlanks')
+    .addItem('Status',              'kreq_status')
+    .addItem('Stop',                'kreq_stop')
+    .addItem('Reset progress',      'kreq_reset')
     .addToUi();
 }
-
-function startAnalyzerAll(){
+function kreq_startAll(){  kreq__kick_('all');  }
+function kreq_startBlanks(){kreq__kick_('blanks');}
+function kreq__kick_(mode){
   const p = PropertiesService.getDocumentProperties();
-  p.deleteProperty('HALT'); // clear kill-switch
-  ensureTrig_();
-  runBatch_();              // kick off immediately
+  kreq_reset_();
+  p.setProperty(KREQ_PROP.mode, mode);
+  p.setProperty(KREQ_PROP.sheetName, SpreadsheetApp.getActiveSheet().getSheetName());
+  kreq_ensureTrig_();
+  kreq_runBatch_();
 }
-
-function statusAnalyzerAll(){
+function kreq_status(){
   const p = PropertiesService.getDocumentProperties();
-  toast_(`Progress ${+(p.getProperty('idx')||0)}/${+(p.getProperty('total')||0)}`,5);
+  const msg = 'Karma '+(+(p.getProperty(KREQ_PROP.idx)||0))+'/'+(+(p.getProperty(KREQ_PROP.total)||0))+
+              (p.getProperty(KREQ_LAST_ERR)?(' | last: '+p.getProperty(KREQ_LAST_ERR)):'');
+  kreq_toast_(msg,5);
 }
-
-function stopAnalyzerAll(){
-  PropertiesService.getDocumentProperties().setProperty('HALT','1');
-  delTrig_();
-  toast_('Stop requested',3);
-}
-
-function resetAnalyzerState(){
+function kreq_stop(){ PropertiesService.getDocumentProperties().setProperty(KREQ_PROP.halt,'1'); kreq_delTrig_(); kreq_toast_('Karma: stop requested',3); }
+function kreq_reset(){ kreq_reset_(); kreq_toast_('Karma: state reset',3); }
+function kreq_reset_(){
   const p = PropertiesService.getDocumentProperties();
-  ['rows','idx','total','HALT'].forEach(k=>p.deleteProperty(k));
-  toast_('State reset',3);
+  [KREQ_PROP.rows,KREQ_PROP.idx,KREQ_PROP.total,KREQ_PROP.halt,KREQ_PROP.mode,KREQ_PROP.sheetName,KREQ_LAST_ERR].forEach(function(k){p.deleteProperty(k);});
 }
 
-/******** BATCH CORE ********/
-function runBatch_(){
+/******** CORE (row-by-row; watchdog + time-budget) ********/
+function kreq_runBatch_(){
   const lock = LockService.getDocumentLock();
   if(!lock.tryLock(0)) return;
   try{
-    const sh = SpreadsheetApp.getActiveSheet();
-    const last = sh.getLastRow();
-    if (last < START_ROW) return;
+    kreq_ensureTrig_(); // watchdog
+    const p  = PropertiesService.getDocumentProperties();
+    if (p.getProperty(KREQ_PROP.halt)==='1'){ kreq_delTrig_(); return; }
 
-    const startTs  = Date.now();
-    const deadline = startTs + MAX_EXEC_MS;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = (p.getProperty(KREQ_PROP.sheetName) && ss.getSheetByName(p.getProperty(KREQ_PROP.sheetName))) || ss.getActiveSheet();
+    const last = sh.getLastRow(); if(last < KREQ_START_ROW) return;
 
-    const p = PropertiesService.getDocumentProperties();
-    if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
-
-    if(!p.getProperty('rows')){
-      const rows = buildMissingRows_(sh, last); // only rows with missing E..I
-      p.setProperty('rows', JSON.stringify(rows));
-      p.setProperty('idx','0');
-      p.setProperty('total', String(rows.length));
-      if(!rows.length){ recalcTiersOnly(); delTrig_(); toast_('Nothing to analyze',3); return; }
+    if(!p.getProperty(KREQ_PROP.rows)){
+      const mode = p.getProperty(KREQ_PROP.mode)||'blanks';
+      const rows = kreq_buildRows_(sh, last, mode);
+      p.setProperty(KREQ_PROP.rows, JSON.stringify(rows));
+      p.setProperty(KREQ_PROP.idx,'0');
+      p.setProperty(KREQ_PROP.total,String(rows.length));
+      if(!rows.length){ kreq_toast_('Karma: nothing to process ('+(mode)+')',3); kreq_delTrig_(); return; }
     }
 
-    const rows = JSON.parse(p.getProperty('rows')||'[]');
-    let idx    = +(p.getProperty('idx')||0);
-    const end  = Math.min(idx+BATCH_SIZE, rows.length);
+    const start = Date.now(), deadline = start + KREQ_MAX_EXEC_MS;
+    const rows = JSON.parse(p.getProperty(KREQ_PROP.rows)||'[]');
+    var idx = +(p.getProperty(KREQ_PROP.idx)||0);
+    const end = Math.min(idx + KREQ_BATCH_SIZE, rows.length);
 
-    for(let k=idx; k<end; k++){
-      if (p.getProperty('HALT')==='1'){ delTrig_(); return; }
+    for(var k=idx; k<end; k++){
+      if (p.getProperty(KREQ_PROP.halt)==='1'){ kreq_delTrig_(); return; }
+      if(Date.now()>deadline){ kreq_toast_('Karma: yield at '+k+'/'+rows.length,3); return; }
 
-      analyzeOne_(sh, rows[k]);  // write E..I
-      Utilities.sleep(SLEEP_MS);
-
-      if (Date.now() > deadline){ // yield before time limit
-        p.setProperty('idx', String(k+1));
-        toast_(`Yield at ${k+1}/${rows.length}`,3);
-        return; // the trigger will resume soon
+      const r = rows[k];
+      var value = null, note = null;
+      try{
+        const sub = String(sh.getRange(r, KREQ_COL.SUB).getValue()||'').replace(/^r\//,'').trim();
+        if(!sub){
+          value = 'N/A'; note = 'empty subreddit cell';
+        }else{
+          const res = kreq_calcKarmaForSub_(sub, deadline);
+          value = res.value; note = res.note||'';
+        }
+      }catch(err){
+        const em = String((err && err.message)||err);
+        PropertiesService.getDocumentProperties().setProperty(KREQ_LAST_ERR, em.slice(0,80));
+        if(em.indexOf('TIME_BUDGET')>=0){
+          // nu scriem nimic, nu incrementăm indexul
+          return;
+        }
+        value = 'N/A'; note = ('fatal skipped: '+em).slice(0,240);
       }
+
+      // scriem doar dacă avem value definit
+      if(value!==null){
+        sh.getRange(r, KREQ_COL.KARMA).setValue(value);
+        sh.getRange(r, KREQ_COL.KARMA).setNote(note||'');
+        PropertiesService.getDocumentProperties().setProperty(KREQ_PROP.idx, String(k+1));
+      }
+
+      Utilities.sleep(KREQ_SLEEP_MS);
+      if(Date.now()>deadline){ kreq_toast_('Karma: yield at '+(k+1)+'/'+rows.length,3); return; }
     }
 
-    idx = end;
-    p.setProperty('idx', String(idx));
-    toast_(`Progress ${idx}/${rows.length}`,5);
+    PropertiesService.getDocumentProperties().setProperty(KREQ_PROP.idx, String(end));
+    kreq_toast_('Karma '+end+'/'+rows.length,5);
 
-    if(idx>=rows.length){
-      // retry rows that failed to fill metrics (transient API issues)
-      const retryRows = buildMissingRows_(sh, last);
-      if (retryRows.length){
-        p.setProperty('rows', JSON.stringify(retryRows));
-        p.setProperty('idx','0');
-        p.setProperty('total', String(retryRows.length));
-        toast_(`Retrying ${retryRows.length} rows`,5);
-      }else{
-        // all metrics populated -> compute tiers once
-        recalcTiersOnly();
-        ['rows','idx','total'].forEach(p.deleteProperty, p);
-        delTrig_();
-        toast_('All done',3);
-      }
+    if(end>=rows.length){
+      [KREQ_PROP.rows,KREQ_PROP.idx,KREQ_PROP.total,KREQ_PROP.mode,KREQ_LAST_ERR].forEach(function(k){ PropertiesService.getDocumentProperties().deleteProperty(k); });
+      kreq_delTrig_(); kreq_toast_('Karma: done',3);
     }
   } finally { lock.releaseLock(); }
 }
 
-/******** Build the list of rows with missing E..I ********/
-function buildMissingRows_(sh, last){
-  const A = sh.getRange(START_ROW, COL.SUB, last-START_ROW+1, 1).getValues().flat();
-  const M = sh.getRange(START_ROW, COL.AVG_UPV, last-START_ROW+1, 5).getValues();
+/******** Row selection ********/
+function kreq_buildRows_(sh, last, mode){
+  const A = sh.getRange(KREQ_START_ROW, KREQ_COL.SUB,   last-KREQ_START_ROW+1, 1).getValues().flat();
+  const K = sh.getRange(KREQ_START_ROW, KREQ_COL.KARMA, last-KREQ_START_ROW+1, 1).getValues().flat();
   const rows = [];
-  for (let i=0;i<A.length;i++){
-    const sub = String(A[i]||'').trim();
-    if (!sub) continue;
-    const m = M[i];
-    const missing = !(m && m.length===5 && m.every(v => v!=='' && v!==null));
-    if (missing) rows.push(START_ROW+i);
+  for(var i=0;i<A.length;i++){
+    const sub = String(A[i]||'').trim(); if(!sub) continue;
+    const cur = String(K[i]||'').trim();
+    if(mode==='all' || !cur) rows.push(KREQ_START_ROW+i);
   }
   return rows;
 }
 
-/******** Per-sub: collect E..I within WINDOW_DAYS (fast path) ********/
-function analyzeOne_(sh, row){
-  const sub = String(sh.getRange(row, COL.SUB).getValue()||'').replace(/^r\//,'').trim();
-  if(!sub) return;
+/******** Per-sub computation ********/
+function kreq_calcKarmaForSub_(sub, deadline){
+  if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+  const now = Math.floor(Date.now()/1000);
+  const cutoff = now - KREQ_MIN_AGE_SEC;
 
-  const now  = Math.floor(Date.now()/1000);
-  const from = now - WINDOW_DAYS*86400;
-
-  // Parallel: /about, first page of /new, first page of /comments
-  const base = `https://oauth.reddit.com/r/${encodeURIComponent(sub)}`;
-  const [about, firstPosts, firstComments] = oauthJSONFetchAll_([
-    `${base}/about`,
-    `${base}/new?limit=100`,
-    `${base}/comments?limit=100&sort=new`
-  ]);
-
-  const active_now = (about && (about.data?.active_user_count || about.data?.accounts_active)) || 0;
-
-  // Posts: first page + paginate until cutoff (or MAX_PAGES)
-  let posts = ((firstPosts?.data?.children)||[]).map(x=>x.data).filter(Boolean);
-  let after = firstPosts?.data?.after || null;
-  let pages = 1;
-
-  while(after && pages < MAX_PAGES){
-    const url = `${base}/new?limit=100&after=${encodeURIComponent(after)}`;
-    const j = oauthJSON_(url);
-    const batch = (j?.data?.children||[]).map(x=>x.data).filter(Boolean);
-    if(!batch.length) break;
-    posts = posts.concat(batch);
-    after = j.data.after;
-    pages++;
-    const lastUtc = batch[batch.length-1]?.created_utc || 0;
-    if(lastUtc < from) break;
-    Utilities.sleep(150);
+  const listing = kreq_fetchListingUntil_(sub, cutoff, deadline);
+  if(listing.status!=='ok'){
+    const text = listing.status==='hot'          ? 'too hot (<3h only)'
+               : listing.status==='pagelimit'    ? 'hit page limit (<3h only)'
+               : listing.status==='forbidden'    ? 'private/restricted'
+               : listing.status==='notfound'     ? 'not found'
+               : listing.status==='quarantined'  ? 'quarantined'
+               : listing.status==='ratelimited'  ? 'rate limited (retry later)'
+               : 'listing fetch failed';
+    return { value:'N/A', note: text + ' (pages:'+(listing.pages||0)+' code:'+(listing.code||'-')+')' };
   }
 
-  const postsWindow = posts.filter(p=> (p.created_utc||0) >= from);
-  const postsCount  = postsWindow.length;
-  const postsPerDay = postsCount / WINDOW_DAYS;
+  const posts = listing.posts, firstIdxGte3h = listing.firstIdxGte3h;
+  if(firstIdxGte3h < 0) return { value:'N/A', note:'no post ≥3h found' };
 
-  const scores  = [];
-  const ratios  = [];
-  const posters = new Set();
-  for(const p of postsWindow){
-    const sc = isFinite(p.score) ? p.score : 0;
-    const cm = isFinite(p.num_comments) ? p.num_comments : 0;
-    scores.push(sc);
-    if(p.author && !EXCLUDE_USERS.test(p.author) && !BOT_SUFFIX.test(p.author)) posters.add(p.author);
-    ratios.push(sc / (cm + 1)); // Laplace smoothing
-  }
-  const avgUp    = trimmedMean_(scores, 0.10);
-  const ratioMed = median_(ratios);
+  const endIdx = Math.min(posts.length, firstIdxGte3h + KREQ_SCAN_COUNT);
+  const slice  = posts.slice(firstIdxGte3h, endIdx);
+  if(!slice.length) return { value:'N/A', note:'no eligible window' };
 
-  // Comments: first page only (big speed gain)
-  const comments = ((firstComments?.data?.children)||[]).map(x=>x.data).filter(Boolean)
-                     .filter(c => (c.created_utc||0) >= from);
-  const commenters = new Set();
-  for(const c of comments){
-    if(c.author && !EXCLUDE_USERS.test(c.author) && !BOT_SUFFIX.test(c.author)) commenters.add(c.author);
-  }
-  const uniqueUsers = new Set([...posters, ...commenters]).size;
-
-  // Write metrics
-  sh.getRange(row, COL.AVG_UPV).setValue(isFinite(avgUp)?avgUp:0);
-  sh.getRange(row, COL.PEAK).setValue(active_now);
-  sh.getRange(row, COL.PPD).setValue(isFinite(postsPerDay)?postsPerDay:0);
-  sh.getRange(row, COL.UNIQUE).setValue(uniqueUsers);
-  sh.getRange(row, COL.RATIO).setValue(isFinite(ratioMed)?ratioMed:0);
-}
-
-/******** Tiers from E..I (robust normalization with quantiles) ********/
-function recalcTiersOnly(){
-  const sh = SpreadsheetApp.getActiveSheet();
-  const last = sh.getLastRow();
-  if(last<START_ROW) return;
-
-  const M = sh.getRange(START_ROW, COL.AVG_UPV, last-START_ROW+1, 5).getValues();
-
-  // Gather for quantiles
-  const upArr=[], uniqArr=[], actArr=[], ratioArr=[], ppdArr=[];
-  for(const r of M){
-    const up=n(r[0]), act=n(r[1]), ppd=n(r[2]), unq=n(r[3]), ra=n(r[4]);
-    if(up>0)   upArr.push(up);
-    if(unq>0)  uniqArr.push(unq);
-    if(act>0)  actArr.push(act);
-    if(ra>0)   ratioArr.push(ra);
-    if(ppd>=0) ppdArr.push(ppd);
-  }
-
-  // Use p20–p95 to compress outliers and widen S/A/B spread
-  const q = {
-    upLo: qtile_(upArr,  PCTL_LO), upHi: qtile_(upArr,  PCTL_HI),
-    uqLo: qtile_(uniqArr,PCTL_LO), uqHi: qtile_(uniqArr,PCTL_HI),
-    acLo: qtile_(actArr, PCTL_LO), acHi: qtile_(actArr, PCTL_HI),
-    raLo: qtile_(ratioArr,PCTL_LO),raHi: qtile_(ratioArr,PCTL_HI)
-  };
-
-  const out=[];
-  for(let i=0;i<M.length;i++){
-    const up=n(M[i][0]), act=n(M[i][1]), ppd=n(M[i][2]), unq=n(M[i][3]), ra=n(M[i][4]);
-
-    const sUp   = scale01_(up,  q.upLo, q.upHi);               // ↑ better
-    const sUniq = scale01_(unq, q.uqLo, q.uqHi);               // ↑
-    const sAct  = scale01_(act, q.acLo, q.acHi);               // ↑
-    const sVis  = gaussian_(ppd, IDEAL_POSTS, POSTS_SCALE);    // peak around 50/day
-    const sRat  = 1 - scale01_(ra, q.raLo, q.raHi);            // ↓ smaller better
-
-    const score = Math.round(100*(W.upvotes*sUp + W.unique*sUniq + W.active*sAct + W.postsVis*sVis + W.ratio*sRat));
-
-    const tier = score>=92 ? 'S+'
-               : score>=85 ? 'S'
-               : score>=75 ? 'A'
-               : score>=65 ? 'B'
-               : score>=50 ? 'C'
-               : score>=35 ? 'D'
-               : 'F';
-
-    out.push([`${tier} (${score})`]);
-
-    const note = `up:${sUp.toFixed(2)} uniq:${sUniq.toFixed(2)} act:${sAct.toFixed(2)} vis:${sVis.toFixed(2)} ratio:${sRat.toFixed(2)}`;
-    sh.getRange(START_ROW+i, COL.TIER).setNote(note);
-  }
-  sh.getRange(START_ROW, COL.TIER, out.length, 1).setValues(out);
-}
-
-/******** OAUTH + FETCH ********/
-function oauthJSON_(url){
-  for(let a=0;a<4;a++){
-    try{
-      const r = UrlFetchApp.fetch(url,{
-        headers:{'Authorization':'Bearer '+getToken_(),'User-Agent':UA},
-        muteHttpExceptions:true
-      });
-      const code = r.getResponseCode();
-      if(code===200) return JSON.parse(r.getContentText());
-      if(code===401) invalidateToken_();
-      if(code===429) Utilities.sleep(1000*(a+1)); // backoff on rate limit
-    }catch(e){}
-    Utilities.sleep(400*(a+1));
-  }
-  return null;
-}
-
-// fetchAll for 3 endpoints in parallel
-function oauthJSONFetchAll_(urls){
-  const token = getToken_();
-  const reqs = urls.map(u=>({url:u, headers:{'Authorization':'Bearer '+token,'User-Agent':UA}, muteHttpExceptions:true}));
-  const res  = UrlFetchApp.fetchAll(reqs);
-  return res.map(r=>{
-    try{
-      if (r.getResponseCode()===200) return JSON.parse(r.getContentText());
-    }catch(e){}
-    return null;
+  const livePosts = slice.filter(function(p){
+    if(!p || !p.author) return false;
+    if(KREQ_EXCLUDE_USERS.test(p.author) || KREQ_BOT_SUFFIX.test(p.author)) return false;
+    if(p.stickied) return false;
+    if(kreq_removed_(p)) return false;
+    const t = +p.created_utc || 0;
+    if(!t || t > cutoff) return false;
+    return true;
   });
+  if(!livePosts.length){
+    const info = 'window:'+slice.length+(slice.length<KREQ_SCAN_COUNT?'/<'+KREQ_SCAN_COUNT:'');
+    return { value:'N/A', note:'no surviving posts ('+info+')' };
+  }
+
+  if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+
+  const authors = Array.from(new Set(livePosts.map(function(p){return p.author;})));
+  const infoMap = kreq_fetchUsersInfo_(authors, deadline);
+
+  var best = { total: Infinity, link:0, comment:0, ageDays:0, user:null };
+  for(var ai=0; ai<authors.length; ai++){
+    if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+    const u = authors[ai];
+    const info = infoMap[u];
+    if(!info || !info.live) continue;
+    const link    = +info.link_karma || 0;
+    const comment = +info.comment_karma || 0;
+    const total   = isFinite(+info.total_karma) ? +info.total_karma : (link+comment);
+    const ageDays = info.created_utc ? Math.max(0,(now - info.created_utc)/86400) : 0;
+    if(total < best.total) best = { total: total, link: link, comment: comment, ageDays: ageDays, user: u };
+  }
+
+  if(!isFinite(best.total) || best.total===Infinity){
+    return { value:'N/A', note:'no live user info (sample:'+slice.length+')' };
+  }
+
+  const note = best.link+'|'+best.comment+' | age:'+best.ageDays.toFixed(1)+'d ('+best.user+')' +
+               (slice.length<KREQ_SCAN_COUNT ? ' | sample:'+slice.length : '');
+  return { value: best.total, note: note };
 }
 
-function getToken_(){
+/******** Listing fetch: OAuth → api → old → www (+over18), cu fallback + time-budget ********/
+function kreq_fetchListingUntil_(sub, cutoff, deadline){
+  const posts = [];
+  var after = null, pages = 0, firstIdxGte3h = -1;
+  var firstCode = 0, firstStatus = 'ok';
+
+  while(pages < KREQ_PAGE_LIMIT){
+    if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+
+    const page = kreq_fetchListingPage_(sub, after);
+    if(!page || !page.ok){
+      if(pages===0){ firstStatus = (page && page.status) || 'failed'; firstCode = (page && page.code) || 0; }
+      break;
+    }
+    if(pages===0) firstCode = page.code;
+
+    const batch = (page.json && page.json.data && page.json.data.children || []).map(function(x){return x.data;}).filter(function(d){ return d && typeof d.created_utc==='number'; });
+    if(!batch.length){ if(!after && pages===0) firstStatus='failed'; break; }
+
+    const oldLen = posts.length;
+    Array.prototype.push.apply(posts, batch);
+    after = page.json.data.after || null;
+    pages++;
+
+    if(firstIdxGte3h === -1){
+      for(var i=oldLen; i<posts.length; i++){
+        const t = +posts[i].created_utc || 0;
+        if(t && t <= cutoff){ firstIdxGte3h = i; break; }
+      }
+    }
+    if(firstIdxGte3h !== -1 && (posts.length - firstIdxGte3h) >= KREQ_SCAN_COUNT) break;
+
+    if(!after){
+      if(firstIdxGte3h === -1) firstStatus = 'hot';
+      break;
+    }
+    Utilities.sleep(KREQ_PAGE_SLEEP_MS);
+  }
+
+  if(firstIdxGte3h === -1 && pages >= KREQ_PAGE_LIMIT) firstStatus = 'pagelimit';
+
+  if(firstStatus!=='ok' && posts.length===0){
+    return { status:firstStatus, code:firstCode, pages:pages };
+  }
+  return { status:firstStatus==='ok'?'ok':firstStatus, posts:posts, firstIdxGte3h:firstIdxGte3h, pages:pages, code:firstCode };
+}
+
+function kreq_fetchListingPage_(sub, after){
+  const q = 'limit=100' + (after?('&after='+encodeURIComponent(after)):'') + '&restrict_sr=on&raw_json=1&sr_detail=0';
+  const paths = [
+    {type:'oauth', url:'https://oauth.reddit.com/r/'+encodeURIComponent(sub)+'/new?'+q, hdr:hdrOAuth_()},
+    {type:'api',   url:'https://api.reddit.com/r/'+encodeURIComponent(sub)+'/new?'+q,   hdr:hdrAnon_()},
+    {type:'old',   url:'https://old.reddit.com/r/'+encodeURIComponent(sub)+'/new.json?'+q, hdr:hdrAnon_()},
+    {type:'www',   url:'https://www.reddit.com/r/'+encodeURIComponent(sub)+'/new.json?'+q, hdr:hdrAnon_()}
+  ];
+
+  var lastCode = 0, seenCodes = {};
+  for(var i=0;i<paths.length;i++){
+    const p = paths[i];
+    const r = kreq_fetchJSONWithCode_(p.url, p.hdr);
+    if(r.ok) return r;
+    lastCode = r.code || 0;
+    if(lastCode) seenCodes[lastCode] = true;
+  }
+
+  if(seenCodes[403]) return { ok:false, status:'forbidden',   code:403 };
+  if(seenCodes[451]) return { ok:false, status:'quarantined', code:451 };
+  if(seenCodes[404]) return { ok:false, status:'notfound',    code:404 };
+  if(seenCodes[429]) return { ok:false, status:'ratelimited', code:429 };
+  return { ok:false, status:'failed', code:lastCode||0 };
+}
+
+function hdrAnon_(){
+  return {
+    'User-Agent': KREQ_UA,
+    'Cookie': 'over18=1',
+    'Accept':'application/json',
+    'Accept-Language':'en-US,en;q=0.9'
+  };
+}
+function hdrOAuth_(){
+  return {
+    'Authorization':'Bearer '+kreq_getToken_(),
+    'User-Agent': KREQ_UA,
+    'Accept':'application/json',
+    'Accept-Language':'en-US,en;q=0.9'
+  };
+}
+
+function kreq_fetchJSONWithCode_(url, headers){
+  var wait = 220;
+  for(var a=0;a<5;a++){
+    try{
+      const r = UrlFetchApp.fetch(url,{headers:headers, muteHttpExceptions:true, followRedirects:true});
+      const code = r.getResponseCode();
+      if(code===200){
+        const txt = r.getContentText();
+        try{ return { ok:true, code:code, json: JSON.parse(txt) }; }
+        catch(e){ return { ok:false, code:0 }; }
+      }
+      if(code===401 && headers.Authorization) kreq_invalidateToken_();
+      if(code===429 || code>=500){ Utilities.sleep(wait); wait = Math.min(3000, wait*2); continue; }
+      return { ok:false, code:code };
+    }catch(e){}
+    Utilities.sleep(wait); wait = Math.min(3000, wait*2);
+  }
+  return { ok:false, code:0 };
+}
+
+/******** Users info (cache + retry/backoff + time-budget) ********/
+function kreq_fetchUsersInfo_(users, deadline){
   const cache = CacheService.getScriptCache();
-  const hit = cache.get('reddit_token');
+  const out = {}, toFetch = [];
+
+  for(var i=0;i<users.length;i++){
+    if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+    const u = users[i];
+    const key = KREQ_USER_PREFIX + u.toLowerCase();
+    const hit = cache.get(key);
+    if(hit){ try{ out[u] = JSON.parse(hit); }catch(e){} } else toFetch.push(u);
+  }
+  if(!toFetch.length) return out;
+
+  for(var i0=0;i0<toFetch.length;i0+=KREQ_AUTHOR_CHUNK){
+    if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+    const chunk = toFetch.slice(i0, i0+KREQ_AUTHOR_CHUNK);
+    var infos = new Array(chunk.length).fill(null);
+
+    var retries = 0;
+    while(retries < 2){
+      const token = kreq_getToken_();
+      const res1 = UrlFetchApp.fetchAll(chunk.map(function(u){ return {
+        url:'https://oauth.reddit.com/user/'+encodeURIComponent(u)+'/about',
+        headers:{'Authorization':'Bearer '+token,'User-Agent':KREQ_UA,'Accept':'application/json'},
+        muteHttpExceptions:true, followRedirects:true
+      };}));
+
+      var needRetryAny = false;
+      for(var j=0;j<res1.length;j++){
+        try{
+          const code = res1[j].getResponseCode();
+          if(code===200){
+            const data = JSON.parse(res1[j].getContentText()).data||{};
+            infos[j] = kreq_userInfoFromAbout_(data);
+          }else if(code===404){
+            infos[j] = { live:false };
+          }else if(code===429 || code>=500){
+            needRetryAny = true;
+          }
+        }catch(e){ needRetryAny = true; }
+      }
+      if(!needRetryAny) break;
+      Utilities.sleep(500*(retries+1)); retries++;
+      if(Date.now()>deadline) throw new Error('TIME_BUDGET');
+    }
+
+    const res2 = UrlFetchApp.fetchAll(chunk.map(function(u){ return {
+      url:'https://api.reddit.com/user/'+encodeURIComponent(u)+'/about?raw_json=1',
+      headers:{'User-Agent':KREQ_UA,'Cookie':'over18=1','Accept':'application/json'},
+      muteHttpExceptions:true, followRedirects:true
+    };}));
+    for(var j=0;j<res2.length;j++){
+      if(infos[j]) continue;
+      try{
+        const code = res2[j].getResponseCode();
+        if(code===200){
+          const data = JSON.parse(res2[j].getContentText()).data||{};
+          infos[j] = kreq_userInfoFromAbout_(data);
+        }else{
+          infos[j] = { live:false };
+        }
+      }catch(e){ infos[j] = { live:false }; }
+    }
+
+    for(var j=0;j<chunk.length;j++){
+      const u = chunk[j];
+      const info = infos[j] || { live:false };
+      out[u] = info;
+      cache.put(KREQ_USER_PREFIX+u.toLowerCase(), JSON.stringify(info), KREQ_USER_CACHE_TTL);
+    }
+    Utilities.sleep(KREQ_CHUNK_SLEEP_MS);
+  }
+  return out;
+}
+
+function kreq_userInfoFromAbout_(data){
+  const suspended = !!(data.is_suspended || data.suspension_expiration_utc);
+  const nameOk   = typeof data.name === 'string' && data.name.length>0;
+  return {
+    live:          !!(nameOk && !suspended),
+    total_karma:   data.total_karma,
+    link_karma:    data.link_karma,
+    comment_karma: data.comment_karma,
+    created_utc:   data.created_utc
+  };
+}
+
+/******** Helpers ********/
+function kreq_removed_(p){
+  if(p.removed_by_category) return true;
+  if(p.banned_by) return true;
+  if(p.removal_reason) return true;
+  if(p.mod_reason_title) return true;
+  if(p.mod_removed) return true;
+  if(p.author_removed) return true;
+  return false;
+}
+
+/******** OAuth ********/
+function kreq_getToken_(){
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get(KREQ_TOKEN_KEY);
   if(hit) return hit;
+
   const resp = UrlFetchApp.fetch('https://www.reddit.com/api/v1/access_token',{
     method:'post',
     payload:{grant_type:'client_credentials'},
-    headers:{
-      'Authorization':'Basic '+Utilities.base64Encode(CLIENT_ID+':'+CLIENT_SECRET),
-      'User-Agent':UA
-    },
+    headers:{'Authorization':'Basic '+Utilities.base64Encode(KREQ_CLIENT_ID+':'+KREQ_CLIENT_SECRET),'User-Agent':KREQ_UA,'Accept':'application/json'},
     muteHttpExceptions:true
   });
-  if(resp.getResponseCode()!==200) throw new Error('oauth failed');
+  const code = resp.getResponseCode();
+  if(code!==200) throw new Error('OAuth failed '+code);
   const data = JSON.parse(resp.getContentText());
   const token = data.access_token;
-  cache.put('reddit_token', token, Math.max(60,(data.expires_in||3600)-120));
+  cache.put(KREQ_TOKEN_KEY, token, Math.max(60,(data.expires_in||3600)-120));
   return token;
 }
-function invalidateToken_(){ CacheService.getScriptCache().remove('reddit_token'); }
+function kreq_invalidateToken_(){ CacheService.getScriptCache().remove(KREQ_TOKEN_KEY); }
 
-/******** UTILS ********/
-function n(v){ const x=Number(v); return isFinite(x)?x:0; }
-
-function median_(arr){
-  if(!arr.length) return 0;
-  const a=arr.slice().sort((x,y)=>x-y);
-  const m=Math.floor(a.length/2);
-  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+/******** Triggers + toast (watchdog) ********/
+function kreq_ensureTrig_(){
+  const exists = ScriptApp.getProjectTriggers().some(function(t){return t.getHandlerFunction()==='kreq_runBatch_';});
+  if(!exists) ScriptApp.newTrigger('kreq_runBatch_').timeBased().everyMinutes(1).create();
 }
+function kreq_delTrig_(){ ScriptApp.getProjectTriggers().forEach(function(t){ if(t.getHandlerFunction()==='kreq_runBatch_') ScriptApp.deleteTrigger(t); }); }
+function kreq_toast_(m,s){ SpreadsheetApp.getActive().toast(m,'KARMA REQ',s); }
 
-function trimmedMean_(arr, alpha){
-  const a = arr.filter(x=>isFinite(x));
-  if(!a.length) return 0;
-  a.sort((x,y)=>x-y);
-  const k = Math.floor(alpha*a.length);
-  const slice = a.slice(k, a.length-k);
-  const s = slice.reduce((t,x)=>t+x,0);
-  return s / Math.max(1, slice.length);
-}
-
-function qtile_(arr, p){
-  if(!arr.length) return 0;
-  const a = arr.slice().sort((x,y)=>x-y);
-  const idx = (p/100)*(a.length-1);
-  const lo = Math.floor(idx), hi = Math.ceil(idx), w = idx-lo;
-  return lo===hi ? a[lo] : a[lo]*(1-w)+a[hi]*w;
-}
-
-function scale01_(x, lo, hi){
-  if(!isFinite(x)) return 0;
-  if(hi<=lo) return 0;
-  const t = (x-lo)/(hi-lo);
-  if(t<0) return 0;
-  if(t>1) return 1;
-  return t;
-}
-
-function gaussian_(x, mu, sigma){
-  if(!isFinite(x)||sigma<=0) return 0;
-  const z = x-mu;
-  return Math.exp(-(z*z)/(2*sigma*sigma));
-}
-
-function ensureTrig_(){
-  const has = ScriptApp.getProjectTriggers().some(t=>t.getHandlerFunction()==='runBatch_');
-  if(!has) ScriptApp.newTrigger('runBatch_').timeBased().everyMinutes(1).create();
-}
-
-function delTrig_(){
-  ScriptApp.getProjectTriggers().forEach(t=>{
-    if(t.getHandlerFunction()==='runBatch_') ScriptApp.deleteTrigger(t);
-  });
-}
-
-function toast_(m,s){ SpreadsheetApp.getActive().toast(m,'Reddit Tools',s); }
+/******** Maintenance (optional) ********/
+function kreq_killAllTriggersOnce(){ ScriptApp.getProjectTriggers().forEach(ScriptApp.deleteTrigger); }
